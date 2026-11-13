@@ -1,9 +1,11 @@
+import { CameraType, CameraView, useCameraPermissions } from 'expo-camera';
 import { LinearGradient } from 'expo-linear-gradient';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
   Image,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -17,7 +19,6 @@ import {
   CATALOG_FOODS,
   createExerciseMealEntry,
   createFoodMealEntry,
-  FOOD_IMAGES,
   formatNum,
   resolveMealImageSource,
 } from '../constants/plateCatalog';
@@ -29,7 +30,7 @@ import {
 } from '../services/photos';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { MealEntry, MealItem } from '../types/models';
-import { formatTimeShort } from '../utils/date';
+import { formatTimeShort, inferMealTypeByHour } from '../utils/date';
 import { useIsDesktopStage } from './PhoneStageFrame';
 import { PlateIcon, PlateIconName } from './PlatePrimitives';
 
@@ -62,15 +63,28 @@ function LibrarySheetBody({
   savedOnly: boolean;
   onClose: () => void;
 }) {
-  const { selectedDateKey, saveMealEntry, setActiveTab, showToast } =
+  const { meals, selectedDateKey, saveMealEntry, setActiveTab, showToast } =
     useCalorieTracker();
   const [query, setQuery] = useState('');
 
-  const baseList = savedOnly
-    ? CATALOG_FOODS.filter((f) => f.health >= 8)
-    : CATALOG_FOODS;
-  const filtered = baseList.filter((f) =>
-    f.name.toLowerCase().includes(query.trim().toLowerCase())
+  const seenTitles = new Set<string>();
+  const savedMeals: MealEntry[] = [];
+  if (savedOnly) {
+    for (const m of meals) {
+      if (m.entryType === 'exercise' || m.status === 'pending') continue;
+      const key = m.title.trim().toLowerCase();
+      if (!key || seenTitles.has(key)) continue;
+      seenTitles.add(key);
+      savedMeals.push(m);
+    }
+  }
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredSaved = savedMeals.filter((m) =>
+    m.title.toLowerCase().includes(normalizedQuery)
+  );
+  const filteredCatalog = CATALOG_FOODS.filter((f) =>
+    f.name.toLowerCase().includes(normalizedQuery)
   );
 
   return (
@@ -80,8 +94,8 @@ function LibrarySheetBody({
       </Text>
       <Text style={styles.sheetSub}>
         {savedOnly
-          ? 'Meals you log the most'
-          : 'Search verified meals & quick-add'}
+          ? 'Re-log meals you have scanned before'
+          : 'Search nutrition profiles & quick-add'}
       </Text>
 
       <View style={styles.searchBar}>
@@ -102,50 +116,129 @@ function LibrarySheetBody({
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
-        {filtered.map((food, idx) => (
-          <View
-            key={food.id}
-            style={[
-              styles.libRow,
-              idx === filtered.length - 1 ? { borderBottomWidth: 0 } : null,
-            ]}
-          >
-            <View style={styles.libThumbWrap}>
-              <Image
-                source={FOOD_IMAGES[food.id]}
-                style={styles.libThumb}
-                resizeMode="cover"
-              />
-            </View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.libFoodName} numberOfLines={1}>
-                {food.name}
-              </Text>
-              <Text style={styles.libFoodMeta}>
-                {`${food.kcal} kcal · P ${food.p}g · C ${food.c}g · F ${food.f}g`}
+        {savedOnly ? (
+          filteredSaved.length === 0 ? (
+            <View style={styles.emptySheetBox}>
+              <Text style={styles.emptySheetText}>
+                {savedMeals.length === 0
+                  ? 'No saved meals yet — scan a meal with your camera first.'
+                  : 'No saved meals match your search.'}
               </Text>
             </View>
-            <Pressable
-              onPress={async () => {
-                const entry = createFoodMealEntry(
-                  food,
-                  new Date(),
-                  selectedDateKey
-                );
-                await saveMealEntry(entry);
-                setActiveTab('home');
-                onClose();
-                showToast(`${food.name} added`);
-              }}
-              style={({ pressed }) => [
-                styles.roundDarkBtn,
-                pressed ? { transform: [{ scale: 0.9 }] } : null,
+          ) : (
+            filteredSaved.map((meal, idx) => {
+              const thumbSrc = resolveMealImageSource(meal);
+              return (
+                <View
+                  key={meal.id}
+                  style={[
+                    styles.libRow,
+                    idx === filteredSaved.length - 1
+                      ? { borderBottomWidth: 0 }
+                      : null,
+                  ]}
+                >
+                  <View style={styles.libThumbWrap}>
+                    {thumbSrc ? (
+                      <Image
+                        source={thumbSrc}
+                        style={styles.libThumb}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <PlateIcon
+                        name="flame"
+                        size={20}
+                        color={plateColors.ink2}
+                      />
+                    )}
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.libFoodName} numberOfLines={1}>
+                      {meal.title}
+                    </Text>
+                    <Text style={styles.libFoodMeta}>
+                      {`${Math.round(meal.calories)} kcal · P ${Math.round(
+                        meal.protein
+                      )}g · C ${Math.round(meal.carbs)}g · F ${Math.round(
+                        meal.fat
+                      )}g`}
+                    </Text>
+                  </View>
+                  <Pressable
+                    onPress={async () => {
+                      const now = new Date();
+                      const cloned: MealEntry = {
+                        ...meal,
+                        id: `saved_${now.getTime()}_${Math.random()
+                          .toString(36)
+                          .slice(2, 7)}`,
+                        dateKey: selectedDateKey,
+                        createdAt: now.toISOString(),
+                        mealType: inferMealTypeByHour(now),
+                        servings: 1,
+                        status: 'done',
+                      };
+                      await saveMealEntry(cloned);
+                      setActiveTab('home');
+                      onClose();
+                      showToast(`${meal.title} added`);
+                    }}
+                    style={({ pressed }) => [
+                      styles.roundDarkBtn,
+                      pressed ? { transform: [{ scale: 0.9 }] } : null,
+                    ]}
+                  >
+                    <PlateIcon name="plus" size={18} color="#FFFFFF" />
+                  </Pressable>
+                </View>
+              );
+            })
+          )
+        ) : (
+          filteredCatalog.map((food, idx) => (
+            <View
+              key={food.id}
+              style={[
+                styles.libRow,
+                idx === filteredCatalog.length - 1
+                  ? { borderBottomWidth: 0 }
+                  : null,
               ]}
             >
-              <PlateIcon name="plus" size={18} color="#FFFFFF" />
-            </Pressable>
-          </View>
-        ))}
+              <View style={styles.libThumbWrap}>
+                <PlateIcon name="flame" size={20} color={plateColors.ink2} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.libFoodName} numberOfLines={1}>
+                  {food.name}
+                </Text>
+                <Text style={styles.libFoodMeta}>
+                  {`${food.kcal} kcal · P ${food.p}g · C ${food.c}g · F ${food.f}g`}
+                </Text>
+              </View>
+              <Pressable
+                onPress={async () => {
+                  const entry = createFoodMealEntry(
+                    food,
+                    new Date(),
+                    selectedDateKey
+                  );
+                  await saveMealEntry(entry);
+                  setActiveTab('home');
+                  onClose();
+                  showToast(`${food.name} added`);
+                }}
+                style={({ pressed }) => [
+                  styles.roundDarkBtn,
+                  pressed ? { transform: [{ scale: 0.9 }] } : null,
+                ]}
+              >
+                <PlateIcon name="plus" size={18} color="#FFFFFF" />
+              </Pressable>
+            </View>
+          ))
+        )}
       </ScrollView>
     </View>
   );
@@ -385,9 +478,11 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const isDesktopStage = useIsDesktopStage();
   const { auth, startMealAnalysisJob, showToast } = useCalorieTracker();
 
-  const [camIdx, setCamIdx] = useState<number>(() =>
-    Math.floor(Math.random() * CATALOG_FOODS.length)
-  );
+  const cameraRef = useRef<CameraView | null>(null);
+  const [permission, requestPermission] = useCameraPermissions();
+  const [facing, setFacing] = useState<CameraType>('back');
+  const [cameraReady, setCameraReady] = useState(false);
+  const [capturing, setCapturing] = useState(false);
   const [pickedPhoto, setPickedPhoto] = useState<PickedMealPhoto | null>(null);
   const [userNotes, setUserNotes] = useState('');
   const [scanMode, setScanMode] = useState<
@@ -397,6 +492,12 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
 
   const [scanLineY] = useState(() => new Animated.Value(12));
   const [shutterFlash] = useState(() => new Animated.Value(0));
+
+  useEffect(() => {
+    if (permission && !permission.granted && permission.canAskAgain) {
+      void requestPermission();
+    }
+  }, [permission, requestPermission]);
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -417,11 +518,6 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     return () => loop.stop();
   }, [scanLineY]);
 
-  const currentSample = CATALOG_FOODS[camIdx];
-  const previewSource = pickedPhoto
-    ? { uri: pickedPhoto.uri }
-    : FOOD_IMAGES[currentSample.id];
-
   const handlePickLibrary = async () => {
     try {
       const picked = await pickPhotoFromLibrary();
@@ -434,18 +530,7 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const handleLiveCamera = async () => {
-    try {
-      const captured = await capturePhotoFromCamera();
-      if (captured) {
-        setPickedPhoto(captured);
-      }
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Camera unavailable');
-    }
-  };
-
-  const handleCaptureAnalyze = () => {
+  const triggerShutterFlash = () => {
     Animated.sequence([
       Animated.timing(shutterFlash, {
         toValue: 0.95,
@@ -458,32 +543,167 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
         useNativeDriver: true,
       }),
     ]).start();
+  };
 
-    setTimeout(() => {
-      onClose();
-      startMealAnalysisJob({
-        photoUri: pickedPhoto?.uri ?? null,
-        imageBase64: pickedPhoto?.base64,
-        mimeType: pickedPhoto?.mimeType ?? 'image/jpeg',
-        presetFoodId: pickedPhoto ? undefined : currentSample.id,
-        userNotes: userNotes.trim() || undefined,
+  const buildNotesWithMode = () => {
+    const trimmed = userNotes.trim();
+    if (scanMode === 'label') {
+      return trimmed
+        ? `Nutrition facts label scan. ${trimmed}`
+        : 'Nutrition facts label scan — read calories and macros from the label.';
+    }
+    return trimmed || undefined;
+  };
+
+  const handleCaptureAnalyze = async () => {
+    if (capturing) return;
+
+    if (pickedPhoto) {
+      triggerShutterFlash();
+      const notes = buildNotesWithMode();
+      setTimeout(() => {
+        onClose();
+        void startMealAnalysisJob({
+          photoUri: pickedPhoto.uri,
+          imageBase64: pickedPhoto.base64,
+          mimeType: pickedPhoto.mimeType || 'image/jpeg',
+          userNotes: notes,
+        });
+      }, 150);
+      return;
+    }
+
+    if (!permission?.granted) {
+      if (permission?.canAskAgain !== false) {
+        const res = await requestPermission();
+        if (!res.granted) {
+          showToast('Camera permission is required to scan meals');
+        }
+        return;
+      }
+      try {
+        const captured = await capturePhotoFromCamera();
+        if (captured) {
+          onClose();
+          void startMealAnalysisJob({
+            photoUri: captured.uri,
+            imageBase64: captured.base64,
+            mimeType: captured.mimeType || 'image/jpeg',
+            userNotes: buildNotesWithMode(),
+          });
+        }
+      } catch {
+        if (Platform.OS !== 'web') {
+          void Linking.openSettings();
+        }
+        showToast('Enable camera access in Settings');
+      }
+      return;
+    }
+
+    if (!cameraRef.current || !cameraReady) {
+      showToast('Camera is starting up…');
+      return;
+    }
+
+    setCapturing(true);
+    triggerShutterFlash();
+    try {
+      const shot = await cameraRef.current.takePictureAsync({
+        quality: 0.72,
+        base64: true,
       });
-    }, 170);
+      if (!shot?.uri) {
+        setCapturing(false);
+        showToast('Could not capture photo — please try again');
+        return;
+      }
+      let b64 = shot.base64 || '';
+      if (!b64 && shot.uri.startsWith('data:')) {
+        const comma = shot.uri.indexOf(',');
+        b64 = comma >= 0 ? shot.uri.slice(comma + 1) : '';
+      }
+      const notes = buildNotesWithMode();
+      onClose();
+      void startMealAnalysisJob({
+        photoUri: shot.uri,
+        imageBase64: b64,
+        mimeType: 'image/jpeg',
+        userNotes: notes,
+      });
+    } catch {
+      setCapturing(false);
+      try {
+        const fallbackShot = await capturePhotoFromCamera();
+        if (fallbackShot) {
+          const notes = buildNotesWithMode();
+          onClose();
+          void startMealAnalysisJob({
+            photoUri: fallbackShot.uri,
+            imageBase64: fallbackShot.base64,
+            mimeType: fallbackShot.mimeType || 'image/jpeg',
+            userNotes: notes,
+          });
+          return;
+        }
+      } catch (innerErr) {
+        showToast(
+          innerErr instanceof Error
+            ? innerErr.message
+            : 'Could not capture photo'
+        );
+      }
+    }
   };
 
   const providerLabel = colors.providers[auth.activeProvider].label;
 
   return (
     <View style={styles.scannerRoot}>
-      {/* Background Dish / Photo Viewfinder */}
-      <Image
-        source={previewSource}
-        style={styles.scannerBgImage}
-        resizeMode="cover"
-      />
+      {/* Live Camera Viewfinder (or User's Picked Photo — NEVER stock images) */}
+      {pickedPhoto ? (
+        <Image
+          source={{ uri: pickedPhoto.uri }}
+          style={styles.scannerBgImage}
+          resizeMode="cover"
+        />
+      ) : permission?.granted ? (
+        <CameraView
+          ref={cameraRef}
+          style={styles.scannerBgImage}
+          facing={facing}
+          enableTorch={flashOn && facing === 'back'}
+          flash={flashOn ? 'on' : 'off'}
+          onCameraReady={() => setCameraReady(true)}
+          onMountError={(e) => {
+            showToast(e.message || 'Camera failed to start');
+          }}
+          barcodeScannerSettings={
+            scanMode === 'barcode'
+              ? { barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e', 'qr'] }
+              : undefined
+          }
+          onBarcodeScanned={
+            scanMode === 'barcode'
+              ? ({ data }) => {
+                  if (data && !userNotes.includes(data)) {
+                    setUserNotes((prev) =>
+                      prev ? `${prev} (Barcode: ${data})` : `Barcode: ${data}`
+                    );
+                    showToast(`Barcode scanned: ${data}`);
+                  }
+                }
+              : undefined
+          }
+        />
+      ) : (
+        <View style={[styles.scannerBgImage, { backgroundColor: '#0A0A0D' }]} />
+      )}
+
       <LinearGradient
-        colors={['rgba(0,0,0,0.62)', 'rgba(0,0,0,0.18)', 'rgba(0,0,0,0.78)']}
+        colors={['rgba(0,0,0,0.58)', 'rgba(0,0,0,0.08)', 'rgba(0,0,0,0.78)']}
         locations={[0, 0.45, 1]}
+        pointerEvents="none"
         style={StyleSheet.absoluteFill}
       />
 
@@ -505,8 +725,11 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
 
         <Pressable
           onPress={() => {
-            setPickedPhoto(null);
-            setCamIdx((i) => (i + 1) % CATALOG_FOODS.length);
+            if (pickedPhoto) {
+              setPickedPhoto(null);
+            } else {
+              setFacing((prev) => (prev === 'back' ? 'front' : 'back'));
+            }
           }}
           style={styles.glassCircleBtn}
         >
@@ -514,35 +737,66 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
         </Pressable>
       </View>
 
-      {/* Center Scan Frame + Animated Scanline */}
+      {/* Center Scan Frame + Animated Scanline (or Permission Prompt) */}
       <View style={styles.scannerCenterArea}>
-        <View style={styles.scanFrameBox}>
-          <View style={[styles.cornerBracket, styles.cornerTL]} />
-          <View style={[styles.cornerBracket, styles.cornerTR]} />
-          <View style={[styles.cornerBracket, styles.cornerBL]} />
-          <View style={[styles.cornerBracket, styles.cornerBR]} />
+        {!pickedPhoto && permission && !permission.granted ? (
+          <View style={styles.permissionCard}>
+            <PlateIcon name="camera" size={28} color="#FFFFFF" />
+            <Text style={styles.permissionTitle}>Camera Access Required</Text>
+            <Text style={styles.permissionSub}>
+              Allow Plate to use your camera so you can point at your meal and
+              scan calories directly.
+            </Text>
+            <Pressable
+              onPress={() => {
+                if (permission.canAskAgain) {
+                  void requestPermission();
+                } else if (Platform.OS !== 'web') {
+                  void Linking.openSettings();
+                }
+              }}
+              style={styles.permissionBtn}
+            >
+              <Text style={styles.permissionBtnText}>
+                {permission.canAskAgain
+                  ? 'Allow Camera Access'
+                  : 'Open Settings'}
+              </Text>
+            </Pressable>
+          </View>
+        ) : (
+          <View style={styles.scanFrameBox} pointerEvents="none">
+            <View style={[styles.cornerBracket, styles.cornerTL]} />
+            <View style={[styles.cornerBracket, styles.cornerTR]} />
+            <View style={[styles.cornerBracket, styles.cornerBL]} />
+            <View style={[styles.cornerBracket, styles.cornerBR]} />
 
-          <Animated.View
-            style={[
-              styles.scanLine,
-              { transform: [{ translateY: scanLineY }] },
-            ]}
-          />
-        </View>
+            <Animated.View
+              style={[
+                styles.scanLine,
+                { transform: [{ translateY: scanLineY }] },
+              ]}
+            />
+          </View>
+        )}
 
         <View style={styles.scannerHintRow}>
           <Text style={styles.scannerHintText}>
             {pickedPhoto
-              ? 'Custom photo ready · tap shutter to analyze'
-              : 'Center your meal or upload a photo'}
+              ? 'Photo ready · tap shutter to analyze'
+              : scanMode === 'barcode'
+                ? 'Point camera at package barcode'
+                : scanMode === 'label'
+                  ? 'Point camera at nutrition facts label'
+                  : 'Point camera at your meal & tap shutter'}
           </Text>
-          {Platform.OS !== 'web' ? (
+          {pickedPhoto ? (
             <Pressable
-              onPress={handleLiveCamera}
+              onPress={() => setPickedPhoto(null)}
               style={styles.liveCamChip}
             >
               <PlateIcon name="camera" size={13} color="#FFFFFF" />
-              <Text style={styles.liveCamChipText}>iOS Camera</Text>
+              <Text style={styles.liveCamChipText}>Live Camera</Text>
             </Pressable>
           ) : null}
         </View>
@@ -578,7 +832,7 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
                 key={id}
                 onPress={() => {
                   if (id === 'library') {
-                    handlePickLibrary();
+                    void handlePickLibrary();
                   } else {
                     setScanMode(id);
                   }
@@ -616,16 +870,24 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
           </Pressable>
 
           <Pressable
-            onPress={handleCaptureAnalyze}
+            onPress={() => void handleCaptureAnalyze()}
+            disabled={capturing}
             style={({ pressed }) => [
               styles.shutterOuter,
-              pressed ? { transform: [{ scale: 0.92 }] } : null,
+              pressed || capturing ? { transform: [{ scale: 0.92 }] } : null,
             ]}
           >
-            <View style={styles.shutterInner} />
+            {capturing ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <View style={styles.shutterInner} />
+            )}
           </Pressable>
 
-          <Pressable onPress={handlePickLibrary} style={styles.glassCircleBtn}>
+          <Pressable
+            onPress={() => void handlePickLibrary()}
+            style={styles.glassCircleBtn}
+          >
             <PlateIcon name="image" size={18} color="#FFFFFF" />
           </Pressable>
         </View>
@@ -743,7 +1005,15 @@ function NutritionDetailContent({
               style={styles.detailHeroImg}
               resizeMode="cover"
             />
-          ) : null}
+          ) : (
+            <View style={styles.detailHeroFallback}>
+              <PlateIcon
+                name="flame"
+                size={42}
+                color="rgba(255,255,255,0.28)"
+              />
+            </View>
+          )}
           <LinearGradient
             colors={['rgba(0,0,0,0.45)', 'transparent', 'rgba(0,0,0,0.2)']}
             locations={[0, 0.35, 1]}
@@ -1412,6 +1682,19 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     overflow: 'hidden',
     backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptySheetBox: {
+    paddingVertical: 28,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  emptySheetText: {
+    fontSize: 14,
+    color: plateColors.muted,
+    textAlign: 'center',
+    lineHeight: 20,
   },
   libThumb: {
     width: '100%',
@@ -1604,6 +1887,44 @@ const styles = StyleSheet.create({
     height: 228,
     position: 'relative',
   },
+  permissionCard: {
+    width: '100%',
+    maxWidth: 300,
+    backgroundColor: 'rgba(24,24,28,0.88)',
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+    paddingVertical: 24,
+    paddingHorizontal: 20,
+    alignItems: 'center',
+    gap: 10,
+  },
+  permissionTitle: {
+    color: '#FFFFFF',
+    fontSize: 17,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  permissionSub: {
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 13.5,
+    textAlign: 'center',
+    lineHeight: 19,
+  },
+  permissionBtn: {
+    marginTop: 6,
+    paddingHorizontal: 20,
+    height: 44,
+    borderRadius: 99,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  permissionBtnText: {
+    color: plateColors.ink,
+    fontSize: 14,
+    fontWeight: '700',
+  },
   cornerBracket: {
     position: 'absolute',
     width: 44,
@@ -1757,12 +2078,17 @@ const styles = StyleSheet.create({
   },
   detailHero: {
     height: 300,
-    backgroundColor: '#D8D8DE',
+    backgroundColor: '#18181C',
     position: 'relative',
   },
   detailHeroImg: {
     width: '100%',
     height: '100%',
+  },
+  detailHeroFallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   detailTopBar: {
     position: 'absolute',

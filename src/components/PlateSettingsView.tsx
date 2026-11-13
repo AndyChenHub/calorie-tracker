@@ -1,11 +1,13 @@
 import * as Clipboard from 'expo-clipboard';
 import { LinearGradient } from 'expo-linear-gradient';
 import { router } from 'expo-router';
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -15,13 +17,17 @@ import { formatNum } from '../constants/plateCatalog';
 import { getAppVersionMetadata } from '../constants/version';
 import { useCalorieTracker } from '../context/CalorieContext';
 import {
+  cancelPendingChatGPTSignIn,
+  completeOnDeviceChatGPTCallback,
   disconnectChatGPTOAuth,
   disconnectGoogleOAuth,
   isProviderConfigured,
+  looksLikeOAuthCallbackInput,
   openProviderWebsite,
   PROVIDER_AUTH_PORTALS,
-  signInWithChatGPTOAuth,
   signInWithGoogleOAuth,
+  startChatGPTDeviceCodeSignIn,
+  startChatGPTSignIn,
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { AIProviderId, UserGoals } from '../types/models';
@@ -46,17 +52,32 @@ export function PlateSettingsView({
     companionStatus,
     isCheckingCompanion,
     refreshCompanionStatus,
-    resetDemoData,
     clearAllLogs,
+    exportBackupJson,
+    importBackupJson,
     showToast,
   } = useCalorieTracker();
 
   const isDesktopStage = useIsDesktopStage();
   const [oauthBusy, setOauthBusy] = useState(false);
+  const [awaitingGptCallback, setAwaitingGptCallback] = useState(false);
+  const [callbackUrlDraft, setCallbackUrlDraft] = useState('');
+  const [deviceCodeBusy, setDeviceCodeBusy] = useState(false);
+  const [deviceCodeInfo, setDeviceCodeInfo] = useState<{
+    userCode: string;
+    verificationUrl: string;
+  } | null>(null);
+  const deviceCodeAbortRef = useRef<AbortController | null>(null);
   const [showCompanionEdit, setShowCompanionEdit] = useState(false);
   const [companionUrlDraft, setCompanionUrlDraft] = useState<string | null>(
     null
   );
+
+  useEffect(() => {
+    return () => {
+      deviceCodeAbortRef.current?.abort();
+    };
+  }, []);
 
   const initials = profile.name
     .split(' ')
@@ -73,7 +94,14 @@ export function PlateSettingsView({
     companionStatus
   );
 
-  const chatgptConnected = Boolean(companionStatus?.chatgptOAuth?.connected);
+  const onDeviceChatGPT = Boolean(
+    auth.chatgptOAuth?.connected &&
+      (auth.chatgptOAuth.accessToken || auth.chatgptOAuth.refreshToken)
+  );
+  const chatgptConnected =
+    onDeviceChatGPT || Boolean(companionStatus?.chatgptOAuth?.connected);
+  const chatgptEmail =
+    auth.chatgptOAuth?.email || companionStatus?.chatgptOAuth?.email;
   const googleOAuthConfigured = Boolean(
     companionStatus?.googleOAuth?.configured
   );
@@ -106,34 +134,142 @@ export function PlateSettingsView({
       } else if (target === 'claude') {
         await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
         showToast('Claude key saved');
+      } else if (looksLikeOAuthCallbackInput(clip)) {
+        const session = await completeOnDeviceChatGPTCallback(clip, auth);
+        await updateAuth({
+          activeProvider: 'gpt',
+          chatgptOAuth: session,
+        });
+        setAwaitingGptCallback(false);
+        setCallbackUrlDraft('');
+        showToast(
+          session.email
+            ? `Connected (${session.email})`
+            : 'ChatGPT SSO connected'
+        );
       } else {
         await updateAuth({ openaiApiKey: clip, activeProvider: 'gpt' });
         showToast('OpenAI key saved');
       }
-    } catch {
-      showToast('Paste into the key field directly');
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Paste into the key field directly'
+      );
     }
   };
 
   const handleChatGPTSignIn = async () => {
     setOauthBusy(true);
     try {
-      await signInWithChatGPTOAuth(auth.companionUrl, auth.companionToken);
-      const st = await refreshCompanionStatus(
-        auth.companionUrl,
-        auth.companionToken
-      );
-      await updateAuth({ activeProvider: 'gpt' });
-      showToast(
-        st?.chatgptOAuth?.email
-          ? `Connected (${st.chatgptOAuth.email})`
-          : 'ChatGPT SSO connected'
-      );
+      const res = await startChatGPTSignIn(auth);
+      if (res.mode === 'on_device_connected') {
+        await updateAuth({
+          activeProvider: 'gpt',
+          chatgptOAuth: res.session,
+        });
+        setAwaitingGptCallback(false);
+        setCallbackUrlDraft('');
+        showToast(
+          res.session.email
+            ? `Connected (${res.session.email})`
+            : 'ChatGPT SSO connected'
+        );
+      } else if (res.mode === 'companion_connected') {
+        const st = await refreshCompanionStatus(
+          auth.companionUrl,
+          auth.companionToken
+        );
+        await updateAuth({ activeProvider: 'gpt' });
+        setAwaitingGptCallback(false);
+        showToast(
+          st?.chatgptOAuth?.email
+            ? `Connected (${st.chatgptOAuth.email})`
+            : 'ChatGPT SSO connected'
+        );
+      } else {
+        setAwaitingGptCallback(true);
+        showToast('Approve in Safari, copy 127.0.0.1 URL & tap Complete');
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Sign-in cancelled');
     } finally {
       setOauthBusy(false);
     }
+  };
+
+  const handleCompleteGptCallback = async () => {
+    setOauthBusy(true);
+    try {
+      const candidate =
+        callbackUrlDraft.trim() || (await Clipboard.getStringAsync()).trim();
+      const session = await completeOnDeviceChatGPTCallback(candidate, auth);
+      await updateAuth({
+        activeProvider: 'gpt',
+        chatgptOAuth: session,
+      });
+      setAwaitingGptCallback(false);
+      setCallbackUrlDraft('');
+      showToast(
+        session.email
+          ? `Connected (${session.email})`
+          : 'ChatGPT SSO connected'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Could not complete sign-in'
+      );
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleCancelGptCallback = async () => {
+    await cancelPendingChatGPTSignIn();
+    setAwaitingGptCallback(false);
+    setCallbackUrlDraft('');
+  };
+
+  const handleDeviceCodeSignIn = async () => {
+    deviceCodeAbortRef.current?.abort();
+    const controller = new AbortController();
+    deviceCodeAbortRef.current = controller;
+    setDeviceCodeBusy(true);
+    setDeviceCodeInfo(null);
+    try {
+      const res = await startChatGPTDeviceCodeSignIn(
+        auth,
+        (info) => {
+          setDeviceCodeInfo(info);
+          showToast(`Code ${info.userCode} copied — paste in browser`);
+        },
+        controller.signal
+      );
+      await updateAuth({
+        activeProvider: 'gpt',
+        chatgptOAuth: res.session,
+        ...(res.apiKeyIssued ? { openaiApiKey: res.apiKeyIssued } : {}),
+      });
+      setDeviceCodeInfo(null);
+      setAwaitingGptCallback(false);
+      showToast(
+        res.session.email
+          ? `Connected (${res.session.email})`
+          : 'ChatGPT SSO connected'
+      );
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        showToast(err instanceof Error ? err.message : 'Code sign-in failed');
+      }
+    } finally {
+      setDeviceCodeBusy(false);
+      setDeviceCodeInfo(null);
+    }
+  };
+
+  const handleCancelDeviceCode = () => {
+    deviceCodeAbortRef.current?.abort();
+    setDeviceCodeBusy(false);
+    setDeviceCodeInfo(null);
   };
 
   const handleGoogleSignIn = async () => {
@@ -483,12 +619,20 @@ export function PlateSettingsView({
             {chatgptConnected ? (
               <View style={styles.connectedBanner}>
                 <Text style={styles.connectedBannerText} numberOfLines={1}>
-                  {`✓ ChatGPT SSO (${
-                    companionStatus?.chatgptOAuth?.email || 'Connected'
-                  })`}
+                  {`✓ ChatGPT SSO (${chatgptEmail || 'Connected'})`}
                 </Text>
                 <Pressable
                   onPress={async () => {
+                    const clearedSession = auth.chatgptOAuth
+                      ? {
+                          ...auth.chatgptOAuth,
+                          connected: false,
+                          accessToken: '',
+                          refreshToken: '',
+                          expiresAt: 0,
+                        }
+                      : undefined;
+                    await updateAuth({ chatgptOAuth: clearedSession });
                     await disconnectChatGPTOAuth(
                       auth.companionUrl,
                       auth.companionToken
@@ -501,20 +645,103 @@ export function PlateSettingsView({
                 </Pressable>
               </View>
             ) : (
-              <Pressable
-                onPress={handleChatGPTSignIn}
-                disabled={oauthBusy}
-                style={styles.ssoPrimaryBtn}
-              >
-                {oauthBusy ? (
-                  <ActivityIndicator size="small" color="#FFFFFF" />
+              <>
+                <Pressable
+                  onPress={handleChatGPTSignIn}
+                  disabled={oauthBusy || deviceCodeBusy}
+                  style={styles.ssoPrimaryBtn}
+                >
+                  {oauthBusy ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <PlateIcon name="sparkle" size={16} color="#FFFFFF" />
+                  )}
+                  <Text style={styles.ssoPrimaryBtnText}>
+                    Sign in with ChatGPT (auth.openai.com)
+                  </Text>
+                </Pressable>
+
+                {awaitingGptCallback ? (
+                  <View style={styles.callbackBox}>
+                    <Text style={styles.callbackHint}>
+                      After approving on OpenAI, copy the 127.0.0.1 redirect URL
+                      from your browser bar and tap Complete:
+                    </Text>
+                    <TextInput
+                      value={callbackUrlDraft}
+                      onChangeText={setCallbackUrlDraft}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      placeholder="Or paste http://127.0.0.1:1455/auth/callback?..."
+                      placeholderTextColor={plateColors.faint}
+                      style={styles.callbackInput}
+                    />
+                    <View style={styles.callbackActions}>
+                      <Pressable
+                        onPress={handleCompleteGptCallback}
+                        disabled={oauthBusy}
+                        style={styles.callbackPrimaryBtn}
+                      >
+                        <Text style={styles.callbackPrimaryBtnText}>
+                          Complete Sign-In from Clipboard
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={handleCancelGptCallback}
+                        style={styles.inlineBtn}
+                      >
+                        <Text style={styles.inlineBtnText}>Cancel</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : null}
+
+                {deviceCodeBusy ? (
+                  <View style={styles.callbackBox}>
+                    <View style={styles.deviceCodeHeader}>
+                      <ActivityIndicator size="small" color={plateColors.ink} />
+                      <Text style={styles.deviceCodeTitle}>
+                        {deviceCodeInfo
+                          ? `Code: ${deviceCodeInfo.userCode}`
+                          : 'Requesting sign-in code…'}
+                      </Text>
+                      {deviceCodeInfo ? (
+                        <Pressable
+                          onPress={async () => {
+                            await Clipboard.setStringAsync(
+                              deviceCodeInfo.userCode
+                            );
+                            showToast('Copied sign-in code');
+                          }}
+                          style={styles.inlineBtn}
+                        >
+                          <Text style={styles.inlineBtnText}>Copy</Text>
+                        </Pressable>
+                      ) : null}
+                      <Pressable
+                        onPress={handleCancelDeviceCode}
+                        style={styles.inlineBtn}
+                      >
+                        <Text style={styles.inlineBtnText}>Cancel</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={styles.callbackHint}>
+                      Paste this code on auth.openai.com/codex/device — Plate
+                      finishes connecting automatically.
+                    </Text>
+                  </View>
                 ) : (
-                  <PlateIcon name="sparkle" size={16} color="#FFFFFF" />
+                  <Pressable
+                    onPress={handleDeviceCodeSignIn}
+                    disabled={oauthBusy}
+                    style={styles.secondaryAuthBtn}
+                  >
+                    <Text style={styles.secondaryAuthBtnText}>
+                      Sign in with 8-digit code (no URL copy)
+                    </Text>
+                  </Pressable>
                 )}
-                <Text style={styles.ssoPrimaryBtnText}>
-                  Sign in with ChatGPT (auth.openai.com)
-                </Text>
-              </Pressable>
+              </>
             )}
 
             <View style={styles.keyInputRow}>
@@ -548,11 +775,13 @@ export function PlateSettingsView({
           onPress={() => setShowCompanionEdit((v) => !v)}
           style={styles.companionRow}
         >
-          <Text style={styles.companionLabel}>
-            {`Companion: ${auth.companionUrl}`}
+          <Text style={styles.companionLabel} numberOfLines={1}>
+            {companionStatus?.ok
+              ? `Desktop companion: ${auth.companionUrl} (online)`
+              : 'On-device direct mode (no server needed)'}
           </Text>
           <Text style={styles.companionEditLink}>
-            {showCompanionEdit ? 'Done' : 'Change'}
+            {showCompanionEdit ? 'Done' : 'Advanced'}
           </Text>
         </Pressable>
 
@@ -594,15 +823,55 @@ export function PlateSettingsView({
       </View>
 
       {/* Setup & Data Actions */}
+      <Text style={styles.groupLabel}>Backup & data</Text>
       <View style={[styles.groupCard, cardShadow]}>
+        <Pressable
+          onPress={async () => {
+            try {
+              const json = await exportBackupJson();
+              await Clipboard.setStringAsync(json);
+              if (Platform.OS !== 'web') {
+                await Share.share({
+                  title: 'Plate Settings & Data Backup',
+                  message: json,
+                }).catch(() => {});
+              }
+              showToast('Backup copied (and ready to save)');
+            } catch {
+              showToast('Could not export backup');
+            }
+          }}
+          style={styles.actionRow}
+        >
+          <Text style={styles.actionRowText}>
+            Export settings & data backup
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={async () => {
+            try {
+              const clip = (await Clipboard.getStringAsync()).trim();
+              if (!clip) {
+                showToast('Copy a Plate backup JSON first');
+                return;
+              }
+              await importBackupJson(clip);
+              showToast('Restored settings, goals & logs!');
+            } catch (err) {
+              showToast(
+                err instanceof Error ? err.message : 'Invalid backup JSON'
+              );
+            }
+          }}
+          style={styles.actionRow}
+        >
+          <Text style={styles.actionRowText}>Restore backup from clipboard</Text>
+        </Pressable>
         <Pressable
           onPress={() => router.push('/onboarding')}
           style={styles.actionRow}
         >
           <Text style={styles.actionRowText}>Open Initial Setup</Text>
-        </Pressable>
-        <Pressable onPress={resetDemoData} style={styles.actionRow}>
-          <Text style={styles.actionRowText}>Reset demo data</Text>
         </Pressable>
         <Pressable
           onPress={clearAllLogs}
@@ -811,6 +1080,73 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13.5,
     fontWeight: '600',
+  },
+  secondaryAuthBtn: {
+    height: 38,
+    borderRadius: 12,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  secondaryAuthBtnText: {
+    fontSize: 12.5,
+    fontWeight: '600',
+    color: plateColors.ink2,
+  },
+  callbackBox: {
+    backgroundColor: plateColors.bg,
+    borderRadius: 14,
+    padding: 11,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  callbackHint: {
+    fontSize: 12,
+    lineHeight: 16,
+    color: plateColors.muted,
+  },
+  callbackInput: {
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    fontSize: 12.5,
+    color: plateColors.ink,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  callbackActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  callbackPrimaryBtn: {
+    flex: 1,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  callbackPrimaryBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  deviceCodeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  deviceCodeTitle: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
   },
   connectedBanner: {
     flexDirection: 'row',

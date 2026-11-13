@@ -75,15 +75,30 @@ export interface AppPreferences {
   showEaten: boolean;
 }
 
+export interface ChatGPTOnDeviceSession {
+  connected: boolean;
+  accessToken: string;
+  refreshToken: string;
+  clientId: string;
+  extAgentHostId: string;
+  /** Unix timestamp in seconds (0 if non-expiring) */
+  expiresAt: number;
+  scope?: string;
+  email?: string;
+  name?: string;
+}
+
 export interface ProviderAuthConfig {
   activeProvider: AIProviderId;
-  /** Companion Python server URL for Antigravity SDK & local OAuth SSO callbacks */
+  /** Optional Companion Python server URL for local desktop Antigravity SDK / loopback */
   companionUrl: string;
   companionToken: string;
   /** Direct provider API keys authorized on each provider's website and stored securely on-device */
   claudeApiKey: string;
   openaiApiKey: string;
   geminiApiKey: string;
+  /** Serverless on-device ChatGPT OAuth 2.0 + PKCE session stored in iOS Keychain */
+  chatgptOAuth?: ChatGPTOnDeviceSession;
   /** Preferred models */
   claudeModel: string;
   gptModel: string;

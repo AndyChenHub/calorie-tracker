@@ -60,6 +60,16 @@ jobs:
         env:
           CI: '1'
         run: |
+          BASE_BUILD=$(node -p "parseInt(require('./app.json').expo.ios.buildNumber || '1', 10) || 1")
+          EFFECTIVE_BUILD=$(( BASE_BUILD + ${GITHUB_RUN_NUMBER:-0} ))
+          node -e "
+            const fs = require('fs');
+            const app = JSON.parse(fs.readFileSync('./app.json', 'utf8'));
+            app.expo.ios.buildNumber = String(${EFFECTIVE_BUILD});
+            app.expo.android.versionCode = ${EFFECTIVE_BUILD};
+            fs.writeFileSync('./app.json', JSON.stringify(app, null, 2) + '\n');
+          "
+          echo "Using bundleIdentifier=$(node -p "require('./app.json').expo.ios.bundleIdentifier") CFBundleVersion=${EFFECTIVE_BUILD}"
           npx expo prebuild --platform ios --clean --no-install
           echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
 

@@ -35,13 +35,46 @@ export function getDefaultAuthConfig(): ProviderAuthConfig {
 const WEB_MEALS_KEY = 'plate_meals_v2';
 const LEGACY_WEB_MEALS_KEY = 'calorielens_meals_v1';
 const WEB_GOALS_KEY = 'plate_goals_v2';
+const LEGACY_WEB_GOALS_KEY = 'calorielens_goals_v1';
 const WEB_AUTH_KEY = 'calorielens_auth_v1';
 const WEB_ONBOARDING_KEY = 'calorielens_onboarded_v1';
 const WEB_PROFILE_KEY = 'plate_profile_v1';
+const LEGACY_WEB_PROFILE_KEY = 'calorielens_profile_v1';
 const WEB_PREFS_KEY = 'plate_prefs_v1';
+const LEGACY_WEB_PREFS_KEY = 'calorielens_prefs_v1';
 const WEB_WATER_KEY = 'plate_water_v1';
 const WEB_STEPS_KEY = 'plate_steps_v1';
 const WEB_SEEDED_KEY = 'plate_seeded_v1';
+const WEB_PURGED_DEMO_KEY = 'plate_purged_demo_v1';
+const WEB_PENDING_PKCE_KEY = 'plate_pending_chatgpt_pkce_v1';
+
+export interface PlatePortableBackup {
+  schema: 'plate-backup-v1';
+  exportedAt: string;
+  goals: UserGoals;
+  profile: UserProfile;
+  preferences: AppPreferences;
+  authPreferences: {
+    activeProvider: ProviderAuthConfig['activeProvider'];
+    companionUrl: string;
+    claudeModel: string;
+    gptModel: string;
+    geminiModel: string;
+  };
+  waterByDate: Record<string, number>;
+  stepsByDate: Record<string, number>;
+  meals: MealEntry[];
+}
+
+export interface PendingChatGPTPkceFlow {
+  state: string;
+  codeVerifier: string;
+  nonce: string;
+  redirectUri: string;
+  clientIdSent: string;
+  extAgentHostId: string;
+  createdAt: number;
+}
 
 function readWebMeals(): MealEntry[] {
   try {
@@ -135,7 +168,9 @@ export function computeDailySummaries(
 
 export async function loadGoals(): Promise<UserGoals> {
   try {
-    const raw = globalThis.localStorage?.getItem(WEB_GOALS_KEY);
+    const raw =
+      globalThis.localStorage?.getItem(WEB_GOALS_KEY) ??
+      globalThis.localStorage?.getItem(LEGACY_WEB_GOALS_KEY);
     if (raw) return { ...DEFAULT_GOALS, ...JSON.parse(raw) };
   } catch {
     // ignore
@@ -153,7 +188,9 @@ export async function saveGoals(goals: UserGoals): Promise<void> {
 
 export async function loadUserProfile(): Promise<UserProfile> {
   try {
-    const raw = globalThis.localStorage?.getItem(WEB_PROFILE_KEY);
+    const raw =
+      globalThis.localStorage?.getItem(WEB_PROFILE_KEY) ??
+      globalThis.localStorage?.getItem(LEGACY_WEB_PROFILE_KEY);
     if (raw) return { ...DEFAULT_USER_PROFILE, ...JSON.parse(raw) };
   } catch {
     // ignore
@@ -171,7 +208,9 @@ export async function saveUserProfile(profile: UserProfile): Promise<void> {
 
 export async function loadPreferences(): Promise<AppPreferences> {
   try {
-    const raw = globalThis.localStorage?.getItem(WEB_PREFS_KEY);
+    const raw =
+      globalThis.localStorage?.getItem(WEB_PREFS_KEY) ??
+      globalThis.localStorage?.getItem(LEGACY_WEB_PREFS_KEY);
     if (raw) return { ...DEFAULT_PREFERENCES, ...JSON.parse(raw) };
   } catch {
     // ignore
@@ -249,6 +288,27 @@ export async function saveHasSeededDemo(seeded: boolean): Promise<void> {
   }
 }
 
+export async function loadHasPurgedLegacyDemoSeed(): Promise<boolean> {
+  try {
+    return globalThis.localStorage?.getItem(WEB_PURGED_DEMO_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export async function saveHasPurgedLegacyDemoSeed(
+  purged: boolean
+): Promise<void> {
+  try {
+    globalThis.localStorage?.setItem(
+      WEB_PURGED_DEMO_KEY,
+      purged ? 'true' : 'false'
+    );
+  } catch {
+    // ignore
+  }
+}
+
 export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
   const defaults = getDefaultAuthConfig();
   try {
@@ -287,4 +347,156 @@ export async function saveOnboardingCompleted(
   } catch {
     // ignore
   }
+}
+
+export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow | null> {
+  try {
+    const raw = globalThis.localStorage?.getItem(WEB_PENDING_PKCE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PendingChatGPTPkceFlow;
+    if (
+      !parsed?.state ||
+      !parsed?.codeVerifier ||
+      Date.now() - (parsed.createdAt || 0) > 20 * 60 * 1000
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePendingChatGPTPkce(
+  flow: PendingChatGPTPkceFlow | null
+): Promise<void> {
+  try {
+    if (!flow) {
+      globalThis.localStorage?.removeItem(WEB_PENDING_PKCE_KEY);
+    } else {
+      globalThis.localStorage?.setItem(
+        WEB_PENDING_PKCE_KEY,
+        JSON.stringify(flow)
+      );
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export async function ensureSettingsMirrored(): Promise<void> {
+  // Web storage persists directly in browser localStorage
+}
+
+export async function hasStoredUserConfiguration(): Promise<boolean> {
+  try {
+    const store = globalThis.localStorage;
+    if (!store) return false;
+    return Boolean(
+      store.getItem(WEB_ONBOARDING_KEY) === 'true' ||
+        store.getItem(WEB_GOALS_KEY) ||
+        store.getItem(LEGACY_WEB_GOALS_KEY) ||
+        store.getItem(WEB_PREFS_KEY) ||
+        store.getItem(LEGACY_WEB_PREFS_KEY) ||
+        store.getItem(WEB_PROFILE_KEY) ||
+        store.getItem(LEGACY_WEB_PROFILE_KEY) ||
+        store.getItem(WEB_AUTH_KEY)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function createPortableBackupJson(): Promise<string> {
+  const [goals, profile, preferences, auth, waterByDate, stepsByDate, meals] =
+    await Promise.all([
+      loadGoals(),
+      loadUserProfile(),
+      loadPreferences(),
+      loadAuthConfig(),
+      loadWaterByDate(),
+      loadStepsByDate(),
+      loadAllMeals(),
+    ]);
+
+  const payload: PlatePortableBackup = {
+    schema: 'plate-backup-v1',
+    exportedAt: new Date().toISOString(),
+    goals,
+    profile,
+    preferences,
+    authPreferences: {
+      activeProvider: auth.activeProvider,
+      companionUrl: auth.companionUrl,
+      claudeModel: auth.claudeModel,
+      gptModel: auth.gptModel,
+      geminiModel: auth.geminiModel,
+    },
+    waterByDate,
+    stepsByDate,
+    meals,
+  };
+
+  return JSON.stringify(payload, null, 2);
+}
+
+export async function restorePortableBackupJson(rawJson: string): Promise<{
+  goals: UserGoals;
+  profile: UserProfile;
+  preferences: AppPreferences;
+  auth: ProviderAuthConfig;
+  waterByDate: Record<string, number>;
+  stepsByDate: Record<string, number>;
+  meals: MealEntry[];
+}> {
+  const parsed = JSON.parse(rawJson.trim()) as Partial<PlatePortableBackup>;
+  if (!parsed || parsed.schema !== 'plate-backup-v1') {
+    throw new Error('Clipboard does not contain a valid Plate backup JSON.');
+  }
+
+  const currentAuth = await loadAuthConfig();
+  const nextGoals: UserGoals = { ...DEFAULT_GOALS, ...(parsed.goals || {}) };
+  const nextProfile: UserProfile = {
+    ...DEFAULT_USER_PROFILE,
+    ...(parsed.profile || {}),
+  };
+  const nextPreferences: AppPreferences = {
+    ...DEFAULT_PREFERENCES,
+    ...(parsed.preferences || {}),
+  };
+  const nextAuth: ProviderAuthConfig = {
+    ...currentAuth,
+    ...(parsed.authPreferences || {}),
+  };
+  const nextWater =
+    parsed.waterByDate && typeof parsed.waterByDate === 'object'
+      ? parsed.waterByDate
+      : {};
+  const nextSteps =
+    parsed.stepsByDate && typeof parsed.stepsByDate === 'object'
+      ? parsed.stepsByDate
+      : {};
+  const nextMeals = Array.isArray(parsed.meals) ? parsed.meals : [];
+
+  await Promise.all([
+    saveGoals(nextGoals),
+    saveUserProfile(nextProfile),
+    savePreferences(nextPreferences),
+    saveAuthConfig(nextAuth),
+    saveWaterByDate(nextWater),
+    saveStepsByDate(nextSteps),
+    replaceAllMeals(nextMeals),
+    saveOnboardingCompleted(true),
+    saveHasSeededDemo(true),
+  ]);
+
+  return {
+    goals: nextGoals,
+    profile: nextProfile,
+    preferences: nextPreferences,
+    auth: nextAuth,
+    waterByDate: nextWater,
+    stepsByDate: nextSteps,
+    meals: nextMeals,
+  };
 }

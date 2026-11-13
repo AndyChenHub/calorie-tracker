@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard';
 import { router } from 'expo-router';
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -21,13 +21,17 @@ import { PlateIcon } from '../components/PlatePrimitives';
 import { getAppVersionMetadata } from '../constants/version';
 import { useCalorieTracker } from '../context/CalorieContext';
 import {
+  cancelPendingChatGPTSignIn,
+  completeOnDeviceChatGPTCallback,
   disconnectChatGPTOAuth,
   disconnectGoogleOAuth,
   isProviderConfigured,
+  looksLikeOAuthCallbackInput,
   openProviderWebsite,
   PROVIDER_AUTH_PORTALS,
-  signInWithChatGPTOAuth,
   signInWithGoogleOAuth,
+  startChatGPTDeviceCodeSignIn,
+  startChatGPTSignIn,
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { AIProviderId } from '../types/models';
@@ -48,6 +52,7 @@ const MACRO_SPLITS: Record<
 export default function OnboardingScreen() {
   const isDesktopStage = useIsDesktopStage();
   const {
+    hasCompletedOnboarding,
     goals,
     updateGoals,
     auth,
@@ -62,6 +67,7 @@ export default function OnboardingScreen() {
     String(goals.dailyCalories || 2250)
   );
   const [macroSplit, setMacroSplit] = useState<MacroSplitId>('balanced');
+  const [goalsEdited, setGoalsEdited] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<AIProviderId>(
     auth.activeProvider
   );
@@ -75,20 +81,42 @@ export default function OnboardingScreen() {
   const geminiKey = geminiKeyDraft ?? auth.geminiApiKey;
 
   const [oauthBusy, setOauthBusy] = useState(false);
+  const [awaitingGptCallback, setAwaitingGptCallback] = useState(false);
+  const [callbackUrlDraft, setCallbackUrlDraft] = useState('');
+  const [deviceCodeBusy, setDeviceCodeBusy] = useState(false);
+  const [deviceCodeInfo, setDeviceCodeInfo] = useState<{
+    userCode: string;
+    verificationUrl: string;
+  } | null>(null);
+  const deviceCodeAbortRef = useRef<AbortController | null>(null);
   const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
 
+  useEffect(() => {
+    return () => {
+      deviceCodeAbortRef.current?.abort();
+    };
+  }, []);
+
   const parsedCalories = Math.max(800, parseInt(calorieInput, 10) || 2250);
   const split = MACRO_SPLITS[macroSplit];
-  const computedProtein = Math.round((parsedCalories * split.p) / 4);
-  const computedCarbs = Math.round((parsedCalories * split.c) / 4);
-  const computedFat = Math.round((parsedCalories * split.f) / 9);
+  const preserveSavedMacros = hasCompletedOnboarding && !goalsEdited;
+  const computedProtein = preserveSavedMacros
+    ? goals.proteinGrams
+    : Math.round((parsedCalories * split.p) / 4);
+  const computedCarbs = preserveSavedMacros
+    ? goals.carbsGrams
+    : Math.round((parsedCalories * split.c) / 4);
+  const computedFat = preserveSavedMacros
+    ? goals.fatGrams
+    : Math.round((parsedCalories * split.f) / 9);
 
   const stepCalories = (delta: number) => {
     const next = Math.max(1000, Math.min(6000, parsedCalories + delta));
+    setGoalsEdited(true);
     setCalorieInput(String(next));
   };
 
@@ -96,17 +124,68 @@ export default function OnboardingScreen() {
     setStatusMsg(null);
     setOauthBusy(true);
     try {
-      await signInWithChatGPTOAuth(auth.companionUrl, auth.companionToken);
-      const st = await refreshCompanionStatus(
-        auth.companionUrl,
-        auth.companionToken
-      );
-      await updateAuth({ activeProvider: 'gpt' });
-      const email = st?.chatgptOAuth?.email;
+      const res = await startChatGPTSignIn(auth);
+      if (res.mode === 'on_device_connected') {
+        await updateAuth({
+          activeProvider: 'gpt',
+          chatgptOAuth: res.session,
+        });
+        setAwaitingGptCallback(false);
+        setCallbackUrlDraft('');
+        setStatusMsg({
+          ok: true,
+          text: res.session.email
+            ? `Connected to ChatGPT (${res.session.email})`
+            : 'Connected via OpenAI ChatGPT SSO!',
+        });
+      } else if (res.mode === 'companion_connected') {
+        const st = await refreshCompanionStatus(
+          auth.companionUrl,
+          auth.companionToken
+        );
+        await updateAuth({ activeProvider: 'gpt' });
+        setAwaitingGptCallback(false);
+        const email = st?.chatgptOAuth?.email;
+        setStatusMsg({
+          ok: true,
+          text: email
+            ? `Connected to ChatGPT (${email})`
+            : 'Connected via OpenAI ChatGPT SSO!',
+        });
+      } else {
+        setAwaitingGptCallback(true);
+        setStatusMsg({
+          ok: true,
+          text: 'Approve in your browser, copy the 127.0.0.1 redirect URL & tap Complete below.',
+        });
+      }
+    } catch (err) {
+      setStatusMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setOauthBusy(false);
+    }
+  };
+
+  const handleCompleteGptCallback = async () => {
+    setStatusMsg(null);
+    setOauthBusy(true);
+    try {
+      const candidate =
+        callbackUrlDraft.trim() || (await Clipboard.getStringAsync()).trim();
+      const session = await completeOnDeviceChatGPTCallback(candidate, auth);
+      await updateAuth({
+        activeProvider: 'gpt',
+        chatgptOAuth: session,
+      });
+      setAwaitingGptCallback(false);
+      setCallbackUrlDraft('');
       setStatusMsg({
         ok: true,
-        text: email
-          ? `Connected to ChatGPT (${email})`
+        text: session.email
+          ? `Connected to ChatGPT (${session.email})`
           : 'Connected via OpenAI ChatGPT SSO!',
       });
     } catch (err) {
@@ -117,6 +196,66 @@ export default function OnboardingScreen() {
     } finally {
       setOauthBusy(false);
     }
+  };
+
+  const handleCancelGptCallback = async () => {
+    await cancelPendingChatGPTSignIn();
+    setAwaitingGptCallback(false);
+    setCallbackUrlDraft('');
+  };
+
+  const handleDeviceCodeSignIn = async () => {
+    deviceCodeAbortRef.current?.abort();
+    const controller = new AbortController();
+    deviceCodeAbortRef.current = controller;
+    setStatusMsg(null);
+    setDeviceCodeBusy(true);
+    setDeviceCodeInfo(null);
+    try {
+      const res = await startChatGPTDeviceCodeSignIn(
+        auth,
+        (info) => {
+          setDeviceCodeInfo(info);
+          setStatusMsg({
+            ok: true,
+            text: `Code ${info.userCode} copied — paste it in your browser window.`,
+          });
+        },
+        controller.signal
+      );
+      if (res.apiKeyIssued) {
+        setOpenaiKeyDraft(res.apiKeyIssued);
+      }
+      await updateAuth({
+        activeProvider: 'gpt',
+        chatgptOAuth: res.session,
+        ...(res.apiKeyIssued ? { openaiApiKey: res.apiKeyIssued } : {}),
+      });
+      setDeviceCodeInfo(null);
+      setAwaitingGptCallback(false);
+      setStatusMsg({
+        ok: true,
+        text: res.session.email
+          ? `Connected to ChatGPT (${res.session.email})`
+          : 'Connected via OpenAI ChatGPT SSO!',
+      });
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setStatusMsg({
+          ok: false,
+          text: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } finally {
+      setDeviceCodeBusy(false);
+      setDeviceCodeInfo(null);
+    }
+  };
+
+  const handleCancelDeviceCode = () => {
+    deviceCodeAbortRef.current?.abort();
+    setDeviceCodeBusy(false);
+    setDeviceCodeInfo(null);
   };
 
   const handleGoogleSignIn = async () => {
@@ -176,29 +315,58 @@ export default function OnboardingScreen() {
         setClaudeKeyDraft(clip);
         await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
         setStatusMsg({ ok: true, text: 'Anthropic Claude key pasted & saved!' });
+      } else if (looksLikeOAuthCallbackInput(clip)) {
+        const session = await completeOnDeviceChatGPTCallback(clip, auth);
+        await updateAuth({
+          activeProvider: 'gpt',
+          chatgptOAuth: session,
+        });
+        setAwaitingGptCallback(false);
+        setCallbackUrlDraft('');
+        setStatusMsg({
+          ok: true,
+          text: session.email
+            ? `Connected to ChatGPT (${session.email})`
+            : 'Connected via OpenAI ChatGPT SSO!',
+        });
       } else {
         setOpenaiKeyDraft(clip);
         await updateAuth({ openaiApiKey: clip, activeProvider: 'gpt' });
         setStatusMsg({ ok: true, text: 'OpenAI key pasted & saved!' });
       }
-    } catch {
+    } catch (err) {
       setStatusMsg({
         ok: false,
-        text: 'Paste directly into the key input below.',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'Paste directly into the key input below.',
       });
+    }
+  };
+
+  const handleSkipSetup = async () => {
+    setSaving(true);
+    try {
+      await completeOnboarding();
+      router.replace('/');
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleFinishSetup = async () => {
     setSaving(true);
     try {
-      await updateGoals({
-        ...goals,
-        dailyCalories: parsedCalories,
-        proteinGrams: computedProtein,
-        carbsGrams: computedCarbs,
-        fatGrams: computedFat,
-      });
+      if (!hasCompletedOnboarding || goalsEdited) {
+        await updateGoals({
+          ...goals,
+          dailyCalories: parsedCalories,
+          proteinGrams: computedProtein,
+          carbsGrams: computedCarbs,
+          fatGrams: computedFat,
+        });
+      }
       await updateAuth({
         activeProvider: selectedProvider,
         claudeApiKey: claudeKey.trim(),
@@ -224,7 +392,14 @@ export default function OnboardingScreen() {
     companionStatus
   );
 
-  const chatgptConnected = Boolean(companionStatus?.chatgptOAuth?.connected);
+  const onDeviceChatGPT = Boolean(
+    auth.chatgptOAuth?.connected &&
+      (auth.chatgptOAuth.accessToken || auth.chatgptOAuth.refreshToken)
+  );
+  const chatgptConnected =
+    onDeviceChatGPT || Boolean(companionStatus?.chatgptOAuth?.connected);
+  const chatgptEmail =
+    auth.chatgptOAuth?.email || companionStatus?.chatgptOAuth?.email;
   const googleOAuthConfigured = Boolean(
     companionStatus?.googleOAuth?.configured
   );
@@ -258,7 +433,7 @@ export default function OnboardingScreen() {
             </View>
 
             <Pressable
-              onPress={handleFinishSetup}
+              onPress={handleSkipSetup}
               style={styles.skipPill}
             >
               <Text style={styles.skipPillText}>Skip</Text>
@@ -299,7 +474,10 @@ export default function OnboardingScreen() {
               <View style={styles.calorieInputCenter}>
                 <TextInput
                   value={calorieInput}
-                  onChangeText={setCalorieInput}
+                  onChangeText={(v) => {
+                    setGoalsEdited(true);
+                    setCalorieInput(v);
+                  }}
                   keyboardType="numeric"
                   maxLength={5}
                   style={styles.calorieBigInput}
@@ -321,7 +499,10 @@ export default function OnboardingScreen() {
                 return (
                   <Pressable
                     key={val}
-                    onPress={() => setCalorieInput(String(val))}
+                    onPress={() => {
+                      setGoalsEdited(true);
+                      setCalorieInput(String(val));
+                    }}
                     style={[
                       styles.presetChip,
                       active ? styles.presetChipActive : null,
@@ -342,11 +523,14 @@ export default function OnboardingScreen() {
 
             <View style={styles.segmentedBar}>
               {(Object.keys(MACRO_SPLITS) as MacroSplitId[]).map((id) => {
-                const active = macroSplit === id;
+                const active = !preserveSavedMacros && macroSplit === id;
                 return (
                   <Pressable
                     key={id}
-                    onPress={() => setMacroSplit(id)}
+                    onPress={() => {
+                      setGoalsEdited(true);
+                      setMacroSplit(id);
+                    }}
                     style={[
                       styles.segItem,
                       active ? styles.segItemActive : null,
@@ -556,12 +740,20 @@ export default function OnboardingScreen() {
                 {chatgptConnected ? (
                   <View style={styles.connectedRow}>
                     <Text style={styles.connectedText} numberOfLines={1}>
-                      {`✓ ChatGPT SSO (${
-                        companionStatus?.chatgptOAuth?.email || 'Connected'
-                      })`}
+                      {`✓ ChatGPT SSO (${chatgptEmail || 'Connected'})`}
                     </Text>
                     <Pressable
                       onPress={async () => {
+                        const clearedSession = auth.chatgptOAuth
+                          ? {
+                              ...auth.chatgptOAuth,
+                              connected: false,
+                              accessToken: '',
+                              refreshToken: '',
+                              expiresAt: 0,
+                            }
+                          : undefined;
+                        await updateAuth({ chatgptOAuth: clearedSession });
                         await disconnectChatGPTOAuth(
                           auth.companionUrl,
                           auth.companionToken
@@ -573,20 +765,109 @@ export default function OnboardingScreen() {
                     </Pressable>
                   </View>
                 ) : (
-                  <Pressable
-                    onPress={handleChatGPTSignIn}
-                    disabled={oauthBusy}
-                    style={styles.ssoBtn}
-                  >
-                    {oauthBusy ? (
-                      <ActivityIndicator size="small" color="#FFFFFF" />
+                  <>
+                    <Pressable
+                      onPress={handleChatGPTSignIn}
+                      disabled={oauthBusy || deviceCodeBusy}
+                      style={styles.ssoBtn}
+                    >
+                      {oauthBusy ? (
+                        <ActivityIndicator size="small" color="#FFFFFF" />
+                      ) : (
+                        <PlateIcon name="sparkle" size={16} color="#FFFFFF" />
+                      )}
+                      <Text style={styles.ssoBtnText}>
+                        Sign in with ChatGPT (auth.openai.com)
+                      </Text>
+                    </Pressable>
+
+                    {awaitingGptCallback ? (
+                      <View style={styles.callbackBox}>
+                        <Text style={styles.callbackHint}>
+                          After approving on OpenAI, copy the 127.0.0.1 redirect
+                          URL from your browser bar and tap Complete:
+                        </Text>
+                        <TextInput
+                          value={callbackUrlDraft}
+                          onChangeText={setCallbackUrlDraft}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                          placeholder="Or paste http://127.0.0.1:1455/auth/callback?..."
+                          placeholderTextColor={plateColors.faint}
+                          style={styles.callbackInput}
+                        />
+                        <View style={styles.callbackActions}>
+                          <Pressable
+                            onPress={handleCompleteGptCallback}
+                            disabled={oauthBusy}
+                            style={styles.callbackPrimaryBtn}
+                          >
+                            <Text style={styles.callbackPrimaryBtnText}>
+                              Complete Sign-In from Clipboard
+                            </Text>
+                          </Pressable>
+                          <Pressable
+                            onPress={handleCancelGptCallback}
+                            style={styles.miniBtn}
+                          >
+                            <Text style={styles.miniBtnText}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    ) : null}
+
+                    {deviceCodeBusy ? (
+                      <View style={styles.callbackBox}>
+                        <View style={styles.deviceCodeHeader}>
+                          <ActivityIndicator
+                            size="small"
+                            color={plateColors.ink}
+                          />
+                          <Text style={styles.deviceCodeTitle}>
+                            {deviceCodeInfo
+                              ? `Code: ${deviceCodeInfo.userCode}`
+                              : 'Requesting sign-in code…'}
+                          </Text>
+                          {deviceCodeInfo ? (
+                            <Pressable
+                              onPress={async () => {
+                                await Clipboard.setStringAsync(
+                                  deviceCodeInfo.userCode
+                                );
+                                setStatusMsg({
+                                  ok: true,
+                                  text: `Copied code ${deviceCodeInfo.userCode}`,
+                                });
+                              }}
+                              style={styles.miniBtn}
+                            >
+                              <Text style={styles.miniBtnText}>Copy</Text>
+                            </Pressable>
+                          ) : null}
+                          <Pressable
+                            onPress={handleCancelDeviceCode}
+                            style={styles.miniBtn}
+                          >
+                            <Text style={styles.miniBtnText}>Cancel</Text>
+                          </Pressable>
+                        </View>
+                        <Text style={styles.callbackHint}>
+                          Paste this code on auth.openai.com/codex/device —
+                          Plate finishes connecting automatically.
+                        </Text>
+                      </View>
                     ) : (
-                      <PlateIcon name="sparkle" size={16} color="#FFFFFF" />
+                      <Pressable
+                        onPress={handleDeviceCodeSignIn}
+                        disabled={oauthBusy}
+                        style={styles.secondaryAuthBtn}
+                      >
+                        <Text style={styles.secondaryAuthBtnText}>
+                          Sign in with 8-digit code (no URL copy)
+                        </Text>
+                      </Pressable>
                     )}
-                    <Text style={styles.ssoBtnText}>
-                      Sign in with ChatGPT (auth.openai.com)
-                    </Text>
-                  </Pressable>
+                  </>
                 )}
 
                 <View style={styles.inputRow}>
@@ -840,6 +1121,73 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13.5,
     fontWeight: '600',
+  },
+  secondaryAuthBtn: {
+    height: 36,
+    borderRadius: 11,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  secondaryAuthBtnText: {
+    fontSize: 12.5,
+    fontWeight: '600',
+    color: plateColors.ink2,
+  },
+  callbackBox: {
+    backgroundColor: plateColors.bg,
+    borderRadius: 14,
+    padding: 10,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  callbackHint: {
+    fontSize: 11.5,
+    lineHeight: 15.5,
+    color: plateColors.muted,
+  },
+  callbackInput: {
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    fontSize: 12.5,
+    color: plateColors.ink,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  callbackActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  callbackPrimaryBtn: {
+    flex: 1,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  callbackPrimaryBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12.5,
+    fontWeight: '600',
+  },
+  deviceCodeHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  deviceCodeTitle: {
+    flex: 1,
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
   },
   connectedRow: {
     flexDirection: 'row',

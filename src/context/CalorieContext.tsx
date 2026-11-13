@@ -8,14 +8,9 @@ import React, {
   useState,
 } from 'react';
 import {
-  catalogFoodToItems,
   computeHealthScoreFromMacros,
-  DEFAULT_PLATE_GOALS,
   DEFAULT_PREFERENCES,
   DEFAULT_USER_PROFILE,
-  findCatalogFood,
-  FOOD_IMAGES,
-  generateDemoSeedData,
 } from '../constants/plateCatalog';
 import {
   analyzeMealWithAI,
@@ -25,12 +20,16 @@ import {
 import { assetToBase64, persistMealPhotoUri } from '../services/photos';
 import {
   computeDailySummaries,
+  createPortableBackupJson,
   DEFAULT_GOALS,
   deleteMealById,
+  ensureSettingsMirrored,
   getDefaultAuthConfig,
+  hasStoredUserConfiguration,
   loadAllMeals,
   loadAuthConfig,
   loadGoals,
+  loadHasPurgedLegacyDemoSeed,
   loadHasSeededDemo,
   loadOnboardingCompleted,
   loadPreferences,
@@ -38,8 +37,10 @@ import {
   loadUserProfile,
   loadWaterByDate,
   replaceAllMeals,
+  restorePortableBackupJson,
   saveAuthConfig,
   saveGoals,
+  saveHasPurgedLegacyDemoSeed,
   saveHasSeededDemo,
   saveOnboardingCompleted,
   savePreferences,
@@ -66,7 +67,6 @@ export interface StartMealAnalysisParams {
   photoUri?: string | null;
   imageBase64?: string;
   mimeType?: string;
-  presetFoodId?: string;
   userNotes?: string;
   mealType?: MealType;
 }
@@ -114,8 +114,9 @@ interface CalorieContextValue {
   removeMealEntry: (id: string) => Promise<void>;
   startMealAnalysisJob: (params: StartMealAnalysisParams) => Promise<void>;
   refineMealEntry: (entryId: string, instruction: string) => Promise<boolean>;
-  resetDemoData: () => Promise<void>;
   clearAllLogs: () => Promise<void>;
+  exportBackupJson: () => Promise<string>;
+  importBackupJson: (rawJson: string) => Promise<void>;
 }
 
 const CalorieContext = createContext<CalorieContextValue | null>(null);
@@ -154,6 +155,15 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
   const [auth, setAuth] = useState<ProviderAuthConfig>(() =>
     getDefaultAuthConfig()
   );
+  const profileRef = useRef<UserProfile>(profile);
+  const preferencesRef = useRef<AppPreferences>(preferences);
+  const authRef = useRef<ProviderAuthConfig>(auth);
+
+  useEffect(() => {
+    profileRef.current = profile;
+    preferencesRef.current = preferences;
+    authRef.current = auth;
+  }, [profile, preferences, auth]);
   const [companionStatus, setCompanionStatus] =
     useState<CompanionStatusResponse | null>(null);
   const [isCheckingCompanion, setIsCheckingCompanion] = useState(false);
@@ -206,6 +216,8 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
           loadedWater,
           loadedSteps,
           seededBefore,
+          purgedLegacyDemo,
+          hasExistingConfig,
         ] = await Promise.all([
           loadAllMeals(),
           loadGoals(),
@@ -216,30 +228,62 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
           loadWaterByDate(),
           loadStepsByDate(),
           loadHasSeededDemo(),
+          loadHasPurgedLegacyDemoSeed(),
+          hasStoredUserConfiguration(),
         ]);
 
         let initialMeals = loadedMeals;
         let initialWater = loadedWater;
         let initialSteps = loadedSteps;
 
-        if (!seededBefore && loadedMeals.length === 0) {
-          const seeded = generateDemoSeedData();
-          initialMeals = seeded.meals;
-          initialWater = seeded.waterByDate;
-          initialSteps = seeded.stepsByDate;
-          await Promise.all([
-            replaceAllMeals(initialMeals),
-            saveWaterByDate(initialWater),
-            saveStepsByDate(initialSteps),
-            saveHasSeededDemo(true),
-          ]);
+        // Never seed sample meals/images on startup, and purge legacy auto-seeded demo data once on upgrade
+        if (!purgedLegacyDemo) {
+          const withoutPresetSamples = loadedMeals.filter(
+            (m) => !(Boolean(m.presetFoodId) && !m.photoUri)
+          );
+          const hasRealUserMeals = withoutPresetSamples.some(
+            (m) => m.entryType !== 'exercise' && Boolean(m.photoUri)
+          );
+
+          if (seededBefore && !hasRealUserMeals) {
+            initialMeals = [];
+            initialWater = {};
+            initialSteps = {};
+            await Promise.all([
+              replaceAllMeals([]),
+              saveWaterByDate({}),
+              saveStepsByDate({}),
+              saveHasPurgedLegacyDemoSeed(true),
+            ]);
+          } else if (withoutPresetSamples.length !== loadedMeals.length) {
+            initialMeals = withoutPresetSamples;
+            await Promise.all([
+              replaceAllMeals(initialMeals),
+              saveHasPurgedLegacyDemoSeed(true),
+            ]);
+          } else {
+            await saveHasPurgedLegacyDemoSeed(true);
+          }
         }
 
+        // Preserve user setup across app updates: never force existing users back into onboarding
+        const effectiveOnboarded =
+          onboarded || hasExistingConfig || initialMeals.length > 0;
+        if (effectiveOnboarded && !onboarded) {
+          await saveOnboardingCompleted(true);
+        }
+
+        // Back up pre-existing SQLite settings into Documents + iOS Keychain mirrors
+        void ensureSettingsMirrored();
+
         if (!mounted) return;
+        profileRef.current = loadedProfile;
+        preferencesRef.current = loadedPrefs;
+        authRef.current = loadedAuth;
         setMeals(initialMeals);
         setGoals(loadedGoals);
         setAuth(loadedAuth);
-        setHasCompletedOnboarding(onboarded);
+        setHasCompletedOnboarding(effectiveOnboarded);
         setProfile(loadedProfile);
         setPreferences(loadedPrefs);
         setWaterByDate(initialWater);
@@ -323,22 +367,21 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     await saveGoals(nextGoals);
   }, []);
 
-  const updateProfile = useCallback(
-    async (patch: Partial<UserProfile>) => {
-      const merged = { ...profile, ...patch };
-      setProfile(merged);
-      await saveUserProfile(merged);
-    },
-    [profile]
-  );
+  const updateProfile = useCallback(async (patch: Partial<UserProfile>) => {
+    const merged = { ...profileRef.current, ...patch };
+    profileRef.current = merged;
+    setProfile(merged);
+    await saveUserProfile(merged);
+  }, []);
 
   const updatePreferences = useCallback(
     async (patch: Partial<AppPreferences>) => {
-      const merged = { ...preferences, ...patch };
+      const merged = { ...preferencesRef.current, ...patch };
+      preferencesRef.current = merged;
       setPreferences(merged);
       await savePreferences(merged);
     },
-    [preferences]
+    []
   );
 
   const setWaterForDate = useCallback(
@@ -361,14 +404,31 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     [stepsByDate]
   );
 
-  const updateAuth = useCallback(
-    async (patch: Partial<ProviderAuthConfig>) => {
-      const merged = { ...auth, ...patch };
-      setAuth(merged);
-      await saveAuthConfig(merged);
-    },
-    [auth]
-  );
+  const updateAuth = useCallback(async (patch: Partial<ProviderAuthConfig>) => {
+    const merged = { ...authRef.current, ...patch };
+    authRef.current = merged;
+    setAuth(merged);
+    await saveAuthConfig(merged);
+  }, []);
+
+  const exportBackupJson = useCallback(async () => {
+    return createPortableBackupJson();
+  }, []);
+
+  const importBackupJson = useCallback(async (rawJson: string) => {
+    const restored = await restorePortableBackupJson(rawJson);
+    profileRef.current = restored.profile;
+    preferencesRef.current = restored.preferences;
+    authRef.current = restored.auth;
+    setGoals(restored.goals);
+    setProfile(restored.profile);
+    setPreferences(restored.preferences);
+    setAuth(restored.auth);
+    setWaterByDate(restored.waterByDate);
+    setStepsByDate(restored.stepsByDate);
+    setMeals(restored.meals);
+    setHasCompletedOnboarding(true);
+  }, []);
 
   const saveMealEntry = useCallback(async (entry: MealEntry) => {
     await upsertMeal(entry);
@@ -390,6 +450,33 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
   const startMealAnalysisJob = useCallback(
     async (params: StartMealAnalysisParams) => {
+      let b64 = params.imageBase64;
+      let mime = params.mimeType || 'image/jpeg';
+
+      if (!b64 && params.photoUri) {
+        const encoded = await assetToBase64({ uri: params.photoUri });
+        if (encoded) {
+          b64 = encoded.base64;
+          mime = encoded.mimeType;
+        }
+      }
+
+      if (!b64 && !params.userNotes?.trim()) {
+        showToast('Snap a photo of your meal first');
+        return;
+      }
+
+      const providerState = isProviderConfigured(
+        auth.activeProvider,
+        auth,
+        companionStatus
+      );
+      if (!providerState.ready) {
+        showToast(`Connect ${auth.activeProvider.toUpperCase()} in Settings first`);
+        setActiveTab('settings');
+        return;
+      }
+
       const now = new Date();
       const targetDateKey = selectedDateKey || toLocalDateKey(now);
       const entryId = `scan_${now.getTime()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -404,7 +491,6 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         mealType,
         title: 'Analyzing meal…',
         photoUri: params.photoUri ?? null,
-        presetFoodId: params.presetFoodId,
         userNotes: params.userNotes?.trim() || undefined,
         entryType: 'food',
         servings: 1,
@@ -433,127 +519,59 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         );
       }, 120);
 
-      const providerState = isProviderConfigured(
-        auth.activeProvider,
-        auth,
-        companionStatus
-      );
-      const presetFood = findCatalogFood(params.presetFoodId);
-
       try {
-        if (providerState.ready) {
-          let b64 = params.imageBase64;
-          let mime = params.mimeType || 'image/jpeg';
+        const aiResult = await analyzeMealWithAI({
+          provider: auth.activeProvider,
+          auth,
+          imageBase64: b64,
+          mimeType: mime,
+          userNotes: params.userNotes,
+          mealType,
+        });
 
-          if (!b64 && params.presetFoodId && FOOD_IMAGES[params.presetFoodId]) {
-            const encoded = await assetToBase64(FOOD_IMAGES[params.presetFoodId]);
-            if (encoded) {
-              b64 = encoded.base64;
-              mime = encoded.mimeType;
-            }
-          }
+        const savedPhotoUri = params.photoUri
+          ? await persistMealPhotoUri(params.photoUri, b64, mime)
+          : null;
 
-          const aiResult = await analyzeMealWithAI({
-            provider: auth.activeProvider,
-            auth,
-            imageBase64: b64,
-            mimeType: mime,
-            userNotes: params.userNotes,
-            mealType,
-          });
-
-          const savedPhotoUri = params.photoUri
-            ? await persistMealPhotoUri(params.photoUri, b64, mime)
-            : null;
-
-          clearInterval(progressTimer);
-
-          const finalEntry: MealEntry = {
-            id: entryId,
-            dateKey: targetDateKey,
-            createdAt: now.toISOString(),
-            mealType,
-            title: aiResult.title,
-            photoUri: savedPhotoUri,
-            presetFoodId: savedPhotoUri ? undefined : params.presetFoodId,
-            userNotes: params.userNotes?.trim() || undefined,
-            aiProvider: aiResult.providerUsed,
-            aiSummary: aiResult.summary,
-            confidence: aiResult.confidence,
-            entryType: 'food',
-            servings: 1,
-            healthScore:
-              aiResult.healthScore ??
-              computeHealthScoreFromMacros(
-                aiResult.calories,
-                aiResult.protein,
-                aiResult.carbs,
-                aiResult.fat
-              ),
-            status: 'done',
-            calories: aiResult.calories,
-            protein: aiResult.protein,
-            carbs: aiResult.carbs,
-            fat: aiResult.fat,
-            items: aiResult.items,
-          };
-
-          await upsertMeal(finalEntry);
-          setMeals((prev) =>
-            prev.map((m) => (m.id === entryId ? finalEntry : m))
-          );
-          showToast('Meal analyzed');
-          setTimeout(() => setDetailEntryId(entryId), 550);
-          return;
-        }
-
-        // Fallback when scanning a built-in catalog dish before AI is authorized
-        if (presetFood && !params.photoUri) {
-          const remainingWait = Math.max(400, 2400 - (Date.now() - startedAt));
-          await new Promise((r) => setTimeout(r, remainingWait));
-          clearInterval(progressTimer);
-
-          const finalEntry: MealEntry = {
-            id: entryId,
-            dateKey: targetDateKey,
-            createdAt: now.toISOString(),
-            mealType,
-            title: presetFood.name,
-            presetFoodId: presetFood.id,
-            userNotes: params.userNotes?.trim() || undefined,
-            aiProvider: 'manual',
-            aiSummary: params.userNotes?.trim()
-              ? `Catalog estimate · Note: ${params.userNotes.trim()}`
-              : 'Plate catalog nutrition profile (connect AI in Settings for live custom photo vision).',
-            confidence: 'high',
-            entryType: 'food',
-            servings: 1,
-            healthScore: presetFood.health,
-            status: 'done',
-            calories: presetFood.kcal,
-            protein: presetFood.p,
-            carbs: presetFood.c,
-            fat: presetFood.f,
-            items: catalogFoodToItems(presetFood),
-          };
-
-          await upsertMeal(finalEntry);
-          setMeals((prev) =>
-            prev.map((m) => (m.id === entryId ? finalEntry : m))
-          );
-          showToast('Meal analyzed');
-          setTimeout(() => setDetailEntryId(entryId), 550);
-          return;
-        }
-
-        // Custom photo uploaded while AI provider is not authorized yet
         clearInterval(progressTimer);
-        setMeals((prev) => prev.filter((m) => m.id !== entryId));
-        showToast(`Connect ${auth.activeProvider.toUpperCase()} in Settings first`);
-        setActiveTab('settings');
+
+        const finalEntry: MealEntry = {
+          id: entryId,
+          dateKey: targetDateKey,
+          createdAt: now.toISOString(),
+          mealType,
+          title: aiResult.title,
+          photoUri: savedPhotoUri,
+          userNotes: params.userNotes?.trim() || undefined,
+          aiProvider: aiResult.providerUsed,
+          aiSummary: aiResult.summary,
+          confidence: aiResult.confidence,
+          entryType: 'food',
+          servings: 1,
+          healthScore:
+            aiResult.healthScore ??
+            computeHealthScoreFromMacros(
+              aiResult.calories,
+              aiResult.protein,
+              aiResult.carbs,
+              aiResult.fat
+            ),
+          status: 'done',
+          calories: aiResult.calories,
+          protein: aiResult.protein,
+          carbs: aiResult.carbs,
+          fat: aiResult.fat,
+          items: aiResult.items,
+        };
+
+        await upsertMeal(finalEntry);
+        setMeals((prev) =>
+          prev.map((m) => (m.id === entryId ? finalEntry : m))
+        );
+        showToast('Meal analyzed');
+        setTimeout(() => setDetailEntryId(entryId), 550);
       } catch (err) {
         clearInterval(progressTimer);
-        // If scanning a preset dish failed due to transient network error, fall back gracefully or surface message
         setMeals((prev) => prev.filter((m) => m.id !== entryId));
         const msg = err instanceof Error ? err.message : 'Analysis failed';
         showToast(msg.length > 48 ? `${msg.slice(0, 48)}…` : msg);
@@ -590,11 +608,8 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       try {
         let b64: string | undefined;
         let mime = 'image/jpeg';
-        if (target.photoUri && target.photoUri.startsWith('data:')) {
-          const comma = target.photoUri.indexOf(',');
-          b64 = comma >= 0 ? target.photoUri.slice(comma + 1) : undefined;
-        } else if (target.presetFoodId && FOOD_IMAGES[target.presetFoodId]) {
-          const encoded = await assetToBase64(FOOD_IMAGES[target.presetFoodId]);
+        if (target.photoUri) {
+          const encoded = await assetToBase64({ uri: target.photoUri });
           if (encoded) {
             b64 = encoded.base64;
             mime = encoded.mimeType;
@@ -643,28 +658,6 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     },
     [auth, companionStatus, meals, saveMealEntry, showToast]
   );
-
-  const resetDemoData = useCallback(async () => {
-    const seeded = generateDemoSeedData();
-    const today = toLocalDateKey();
-    await Promise.all([
-      replaceAllMeals(seeded.meals),
-      saveGoals(DEFAULT_PLATE_GOALS),
-      saveUserProfile(DEFAULT_USER_PROFILE),
-      savePreferences(DEFAULT_PREFERENCES),
-      saveWaterByDate(seeded.waterByDate),
-      saveStepsByDate(seeded.stepsByDate),
-      saveHasSeededDemo(true),
-    ]);
-    setMeals(seeded.meals);
-    setGoals(DEFAULT_PLATE_GOALS);
-    setProfile(DEFAULT_USER_PROFILE);
-    setPreferences(DEFAULT_PREFERENCES);
-    setWaterByDate(seeded.waterByDate);
-    setStepsByDate(seeded.stepsByDate);
-    setSelectedDateKey(today);
-    showToast('Demo data reset');
-  }, [showToast]);
 
   const clearAllLogs = useCallback(async () => {
     await Promise.all([
@@ -721,8 +714,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       removeMealEntry,
       startMealAnalysisJob,
       refineMealEntry,
-      resetDemoData,
       clearAllLogs,
+      exportBackupJson,
+      importBackupJson,
     }),
     [
       isReady,
@@ -760,8 +754,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       removeMealEntry,
       startMealAnalysisJob,
       refineMealEntry,
-      resetDemoData,
       clearAllLogs,
+      exportBackupJson,
+      importBackupJson,
     ]
   );
 

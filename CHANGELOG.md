@@ -5,6 +5,19 @@ All notable changes to **CalorieLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-13 (Build 4)
+
+### Changed
+- **Live Camera Meal Scanner (`expo-camera`)**: Replaced the stock-photo preview in the Scanner with a real live rear/front camera viewfinder (`CameraView`), hardware torch/flash toggle, live barcode scanning, and instant shutter capture (`takePictureAsync`) for AI vision analysis.
+- **Zero Sample Images or Demo Data on Startup**: Removed bundled `assets/foods` stock images, disabled startup demo meal/step/water seeding, and added a one-time upgrade purge (`purged_legacy_demo_seed_v1`) that strips legacy sample entries while preserving all user settings, preferences, goals, profile, AI auth, and real scanned meals.
+
+## [1.1.1] - 2026-11-13 (Build 3)
+
+### Changed
+- **Standalone On-Device ChatGPT Sign-In**: Removed the local Companion Server hosting requirement for **Sign in with ChatGPT** (`auth.openai.com`), adding serverless on-device PKCE + 8-digit Device Code sign-in, chunked iOS Keychain token storage, automatic token refresh, and direct `/v1/responses` vision analysis.
+- **Persistent Settings & Preferences Across App Updates**: Mirrored user goals, profile, preferences, AI provider config, and onboarding state across SQLite, `Documents/plate-settings-mirror.json`, and iOS Keychain (`expo-secure-store`) with self-healing startup recovery, dynamic iOS sandbox meal photo path resolution, monotonic `CFBundleVersion` `.ipa` build stamping, and 1-tap JSON backup export/restore.
+- **Custom Plate Brand Icon**: Replaced default Expo icons across iOS, Android adaptive/monochrome, splash screen, web favicon, and in-app brand header.
+
 ## [1.1.0] - 2026-11-13 (Build 2)
 
 ### Changed

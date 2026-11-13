@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Image,
   Platform,
   StyleSheet,
   Text,
@@ -25,43 +26,24 @@ function formatClock(d: Date): string {
   return `${h}:${m}`;
 }
 
+const PLATE_ICON_SOURCE = require('../../assets/icon.png');
+
 export function PlateLogoMark({ size = 28 }: { size?: number }) {
-  const innerInset = Math.round(size * 0.215);
-  const dotSize = Math.max(6, Math.round(size * 0.22));
+  const radius = Math.round(size * 0.24);
   return (
     <View
       style={{
         width: size,
         height: size,
-        borderRadius: size / 2,
+        borderRadius: radius,
+        overflow: 'hidden',
         backgroundColor: plateColors.ink,
-        position: 'relative',
       }}
     >
-      <View
-        style={{
-          position: 'absolute',
-          top: innerInset,
-          left: innerInset,
-          right: innerInset,
-          bottom: innerInset,
-          borderRadius: size / 2,
-          borderWidth: 2,
-          borderColor: '#FFFFFF',
-        }}
-      />
-      <View
-        style={{
-          position: 'absolute',
-          width: dotSize,
-          height: dotSize,
-          borderRadius: dotSize / 2,
-          backgroundColor: plateColors.carbs,
-          right: -1,
-          top: -1,
-          borderWidth: 2,
-          borderColor: plateColors.bg,
-        }}
+      <Image
+        source={PLATE_ICON_SOURCE}
+        style={{ width: size, height: size }}
+        resizeMode="cover"
       />
     </View>
   );

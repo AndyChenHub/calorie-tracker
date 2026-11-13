@@ -9,17 +9,6 @@ import {
 } from '../types/models';
 import { inferMealTypeByHour, toLocalDateKey } from '../utils/date';
 
-export const FOOD_IMAGES: Record<string, ImageSourcePropType> = {
-  'avocado-toast': require('../../assets/foods/avocado-toast.jpg'),
-  'poke-bowl': require('../../assets/foods/poke-bowl.jpg'),
-  'yogurt-bowl': require('../../assets/foods/yogurt-bowl.jpg'),
-  'chicken-salad': require('../../assets/foods/chicken-salad.jpg'),
-  pasta: require('../../assets/foods/pasta.jpg'),
-  smoothie: require('../../assets/foods/smoothie.jpg'),
-  burger: require('../../assets/foods/burger.jpg'),
-  oats: require('../../assets/foods/oats.jpg'),
-};
-
 export interface CatalogFood {
   id: string;
   name: string;
@@ -230,9 +219,6 @@ export function resolveMealImageSource(
   if (meal.photoUri) {
     return { uri: meal.photoUri };
   }
-  if (meal.presetFoodId && FOOD_IMAGES[meal.presetFoodId]) {
-    return FOOD_IMAGES[meal.presetFoodId];
-  }
   return null;
 }
 
@@ -276,7 +262,6 @@ export function createFoodMealEntry(
     createdAt: date.toISOString(),
     mealType: inferMealTypeByHour(date),
     title: food.name,
-    presetFoodId: food.id,
     entryType: 'food',
     servings: 1,
     healthScore: food.health,
@@ -330,68 +315,6 @@ export function computeHealthScoreFromMacros(
   else if (calories > 950) score -= 2.5;
   if (fatRatio > 0.45) score -= 1.5;
   return Math.max(1, Math.min(10, Math.round(score)));
-}
-
-export function generateDemoSeedData(): {
-  meals: MealEntry[];
-  waterByDate: Record<string, number>;
-  stepsByDate: Record<string, number>;
-} {
-  const rnd = mulberry32(42);
-  const meals: MealEntry[] = [];
-  const waterByDate: Record<string, number> = {};
-  const stepsByDate: Record<string, number> = {};
-
-  for (let i = 1; i < 21; i++) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    const k = toLocalDateKey(d);
-    const pool = [...CATALOG_FOODS]
-      .sort(() => rnd() - 0.5)
-      .slice(0, 3 + (i % 2));
-
-    pool.forEach((f, j) => {
-      const entryDate = new Date(
-        d.getFullYear(),
-        d.getMonth(),
-        d.getDate(),
-        8 + j * 4,
-        10 + j * 7
-      );
-      meals.push(createFoodMealEntry(f, entryDate, k));
-    });
-
-    if (i % 3 === 0) {
-      const exDate = new Date(
-        d.getFullYear(),
-        d.getMonth(),
-        d.getDate(),
-        18,
-        30
-      );
-      meals.push(
-        createExerciseMealEntry(CATALOG_EXERCISES[i % 3], exDate, k)
-      );
-    }
-
-    waterByDate[k] = 4 + Math.floor(rnd() * 5);
-    stepsByDate[k] = 5200 + Math.floor(rnd() * 6500);
-  }
-
-  const todayKey = toLocalDateKey();
-  const ago = (hours: number) => new Date(Date.now() - hours * 3600 * 1000);
-  const poke = findCatalogFood('poke-bowl')!;
-  const yogurt = findCatalogFood('yogurt-bowl')!;
-
-  meals.push(createFoodMealEntry(poke, ago(0.6), todayKey));
-  meals.push(createExerciseMealEntry(CATALOG_EXERCISES[0], ago(2.4), todayKey));
-  meals.push(createFoodMealEntry(yogurt, ago(3.3), todayKey));
-
-  waterByDate[todayKey] = 3;
-  stepsByDate[todayKey] = 6240;
-
-  meals.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  return { meals, waterByDate, stepsByDate };
 }
 
 export function buildWeightSeries(profile: UserProfile): number[] {

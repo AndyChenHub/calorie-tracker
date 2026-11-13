@@ -1,3 +1,5 @@
+import * as Clipboard from 'expo-clipboard';
+import * as Crypto from 'expo-crypto';
 import * as WebBrowser from 'expo-web-browser';
 import { Platform } from 'react-native';
 import { computeHealthScoreFromMacros } from '../constants/plateCatalog';
@@ -5,11 +7,18 @@ import { getAppVersionMetadata } from '../constants/version';
 import {
   AIMealAnalysisResult,
   AIProviderId,
+  ChatGPTOnDeviceSession,
   CompanionStatusResponse,
   MealItem,
   MealType,
   ProviderAuthConfig,
 } from '../types/models';
+import {
+  loadAuthConfig,
+  loadPendingChatGPTPkce,
+  saveAuthConfig,
+  savePendingChatGPTPkce,
+} from './storage';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -18,6 +27,149 @@ export const PROVIDER_AUTH_PORTALS = {
   claude: 'https://console.anthropic.com/settings/keys',
   gpt: 'https://platform.openai.com/api-keys',
 } as const;
+
+const OPENAI_AUTH_URL = 'https://auth.openai.com/api/accounts/authorize';
+const OPENAI_TOKEN_URL = 'https://auth.openai.com/api/accounts/oauth/token';
+const OPENAI_CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+const OPENAI_DEVICE_USERCODE_URL =
+  'https://auth.openai.com/api/accounts/deviceauth/usercode';
+const OPENAI_DEVICE_TOKEN_URL =
+  'https://auth.openai.com/api/accounts/deviceauth/token';
+const OPENAI_DEVICE_VERIFY_URL = 'https://auth.openai.com/codex/device';
+const OPENAI_DEVICE_CALLBACK_URI =
+  'https://auth.openai.com/deviceauth/callback';
+const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const OPENAI_RESOURCE = 'https://api.openai.com/v1';
+const OPENAI_SCOPES =
+  'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct';
+const ON_DEVICE_LOOPBACK_REDIRECT = 'http://127.0.0.1:1455/auth/callback';
+
+const BASE64_CHARS =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i] ?? 0;
+    const b1 = i + 1 < bytes.length ? (bytes[i + 1] ?? 0) : 0;
+    const b2 = i + 2 < bytes.length ? (bytes[i + 2] ?? 0) : 0;
+    const triplet = (b0 << 16) | (b1 << 8) | b2;
+    out += BASE64_CHARS[(triplet >> 18) & 0x3f];
+    out += BASE64_CHARS[(triplet >> 12) & 0x3f];
+    if (i + 1 < bytes.length) {
+      out += BASE64_CHARS[(triplet >> 6) & 0x3f];
+    }
+    if (i + 2 < bytes.length) {
+      out += BASE64_CHARS[triplet & 0x3f];
+    }
+  }
+  return out.replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function base64UrlToUtf8(b64Url: string): string {
+  const normalized = b64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const padded =
+    normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  const bytes: number[] = [];
+  for (let i = 0; i < padded.length; i += 4) {
+    const c0 = BASE64_CHARS.indexOf(padded[i] || 'A');
+    const c1 = BASE64_CHARS.indexOf(padded[i + 1] || 'A');
+    const c2 = padded[i + 2] === '=' ? -1 : BASE64_CHARS.indexOf(padded[i + 2] || 'A');
+    const c3 = padded[i + 3] === '=' ? -1 : BASE64_CHARS.indexOf(padded[i + 3] || 'A');
+    if (c0 < 0 || c1 < 0) break;
+    const triplet =
+      (c0 << 18) | (c1 << 12) | (Math.max(0, c2) << 6) | Math.max(0, c3);
+    bytes.push((triplet >> 16) & 0xff);
+    if (c2 >= 0) bytes.push((triplet >> 8) & 0xff);
+    if (c3 >= 0) bytes.push(triplet & 0xff);
+  }
+  try {
+    if (typeof TextDecoder !== 'undefined') {
+      return new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+    }
+  } catch {
+    // fallback below
+  }
+  return String.fromCharCode(...bytes);
+}
+
+function decodeJwtClaims(token?: string | null): Record<string, unknown> {
+  if (!token || token.split('.').length < 2) return {};
+  try {
+    const jsonStr = base64UrlToUtf8(token.split('.')[1] || '');
+    const parsed = JSON.parse(jsonStr);
+    return parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function generateRandomToken(byteLen = 24): Promise<string> {
+  const bytes = await Crypto.getRandomBytesAsync(byteLen);
+  return bytesToBase64Url(bytes);
+}
+
+async function generatePkcePair(): Promise<{
+  verifier: string;
+  challenge: string;
+}> {
+  const verifier = await generateRandomToken(36);
+  const digestB64 = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    verifier,
+    { encoding: Crypto.CryptoEncoding.BASE64 }
+  );
+  const challenge = digestB64
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return { verifier, challenge };
+}
+
+function ensureExtAgentHostId(existing?: string): string {
+  const trimmed = existing?.trim();
+  if (trimmed) return trimmed;
+  return `urn:uuid:${Crypto.randomUUID()}`;
+}
+
+function encodeFormBody(fields: Record<string, string>): string {
+  return Object.entries(fields)
+    .map(
+      ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`
+    )
+    .join('&');
+}
+
+export function looksLikeOAuthCallbackInput(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  if (
+    /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(trimmed) &&
+    (/[?&](code|error)=/i.test(trimmed))
+  ) {
+    return true;
+  }
+  if (/^[?&]?(code=[^&\s]+&.*state=|state=[^&\s]+&.*code=)/i.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+function parseQueryString(query: string): Record<string, string> {
+  const cleaned = query.replace(/^[?#]/, '');
+  const out: Record<string, string> = {};
+  for (const part of cleaned.split('&')) {
+    if (!part) continue;
+    const eqIdx = part.indexOf('=');
+    if (eqIdx < 0) continue;
+    const k = decodeURIComponent(part.slice(0, eqIdx).replace(/\+/g, ' '));
+    const v = decodeURIComponent(part.slice(eqIdx + 1).replace(/\+/g, ' '));
+    out[k] = v;
+  }
+  return out;
+}
 
 const NUTRITION_SYSTEM_PROMPT = `You are an expert registered dietitian and food nutrition analyst for Plate, an iOS calorie tracker app.
 Analyze the user's meal from the provided food photo and/or user notes (such as gram weights, home-cooked ingredients, sauces, oils, or portion details).
@@ -262,34 +414,457 @@ async function runCompanionBrowserOAuthFlow(options: {
   throw new Error('Authorization was not completed.');
 }
 
-/**
- * Launches OpenAI's official "Sign in with ChatGPT" (SIWC) OAuth 2.0 + PKCE flow
- * directly on https://auth.openai.com/api/accounts/authorize.
- */
-export async function signInWithChatGPTOAuth(
+async function probeCompanionQuickly(
   companionUrl: string,
-  companionToken?: string
-): Promise<CompanionStatusResponse> {
-  return runCompanionBrowserOAuthFlow({
-    companionUrl,
-    companionToken,
-    startPath: '/api/oauth/openai/start',
-    hostOpenPath: '/api/oauth/openai/open-on-host',
-    providerKey: 'gpt',
-    isConnected: (st) => Boolean(st.chatgptOAuth?.connected),
+  companionToken?: string,
+  timeoutMs = 1200
+): Promise<CompanionStatusResponse | null> {
+  const baseUrl = companionUrl.trim().replace(/\/+$/, '');
+  if (!baseUrl) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}/api/status`, {
+      method: 'GET',
+      headers: buildCompanionHeaders(companionToken),
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CompanionStatusResponse;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export type ChatGPTSignInResult =
+  | {
+      mode: 'on_device_connected';
+      session: ChatGPTOnDeviceSession;
+      apiKeyIssued?: string;
+    }
+  | {
+      mode: 'companion_connected';
+      companionStatus: CompanionStatusResponse;
+    }
+  | {
+      mode: 'awaiting_callback';
+      authUrl: string;
+    };
+
+async function buildOnDeviceOpenAIAuthorizeUrl(
+  auth: ProviderAuthConfig
+): Promise<string> {
+  const extAgentHostId = ensureExtAgentHostId(
+    auth.chatgptOAuth?.extAgentHostId
+  );
+  const savedClientId = (auth.chatgptOAuth?.clientId || '').trim();
+  const effectiveClientId = savedClientId || 'dynamic_agent_client';
+  const redirectUri = ON_DEVICE_LOOPBACK_REDIRECT;
+  const { verifier, challenge } = await generatePkcePair();
+  const state = await generateRandomToken(24);
+  const nonce = await generateRandomToken(24);
+
+  const params: Record<string, string> = {
+    client_id: effectiveClientId,
+    ext_agent_host_id: extAgentHostId,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    scope: OPENAI_SCOPES,
+    resource: OPENAI_RESOURCE,
+    state,
+    nonce,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+  };
+  if (effectiveClientId === 'dynamic_agent_client') {
+    params.agent_name_hint = 'Plate';
+  }
+
+  await savePendingChatGPTPkce({
+    state,
+    codeVerifier: verifier,
+    nonce,
+    redirectUri,
+    clientIdSent: effectiveClientId,
+    extAgentHostId,
+    createdAt: Date.now(),
   });
+
+  return `${OPENAI_AUTH_URL}?${encodeFormBody(params)}`;
+}
+
+/**
+ * Completes an on-device OpenAI PKCE flow from the callback redirect URL
+ * (e.g. http://127.0.0.1:1455/auth/callback?code=...&state=...&client_id=oaiapp_...)
+ * directly on the device without needing any backend server.
+ */
+export async function completeOnDeviceChatGPTCallback(
+  rawCallbackInput: string,
+  auth: ProviderAuthConfig
+): Promise<ChatGPTOnDeviceSession> {
+  const trimmed = rawCallbackInput.trim();
+  if (!trimmed) {
+    throw new Error(
+      'Clipboard does not have the callback URL yet. Copy the 127.0.0.1 redirect URL from your browser address bar and try again.'
+    );
+  }
+
+  const pending = await loadPendingChatGPTPkce();
+  if (!pending) {
+    throw new Error(
+      'Sign-in session expired. Tap "Sign in with ChatGPT" to start a fresh login.'
+    );
+  }
+
+  let params: Record<string, string> = {};
+  const qIdx = trimmed.indexOf('?');
+  if (qIdx >= 0) {
+    const queryPart = trimmed.slice(qIdx + 1).split('#')[0] || '';
+    params = parseQueryString(queryPart);
+  } else if (trimmed.includes('=')) {
+    params = parseQueryString(trimmed);
+  } else {
+    params = { code: trimmed };
+  }
+
+  if (params.error) {
+    await savePendingChatGPTPkce(null);
+    throw new Error(params.error_description || params.error);
+  }
+
+  const code = (params.code || '').trim();
+  if (!code) {
+    throw new Error(
+      'No authorization code found. Copy the full 127.0.0.1 redirect URL from the browser bar after approving Plate.'
+    );
+  }
+
+  if (params.state && params.state !== pending.state) {
+    throw new Error(
+      'Sign-in state mismatch (from an older tab). Tap "Sign in with ChatGPT" to try again.'
+    );
+  }
+
+  const issuedClientId = (params.client_id || '').trim();
+  const savedClientId = (auth.chatgptOAuth?.clientId || '').trim();
+  const effectiveClientId =
+    issuedClientId || savedClientId || pending.clientIdSent;
+
+  const res = await fetch(OPENAI_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: encodeFormBody({
+      grant_type: 'authorization_code',
+      client_id: effectiveClientId,
+      code,
+      redirect_uri: pending.redirectUri,
+      code_verifier: pending.codeVerifier,
+      resource: OPENAI_RESOURCE,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(
+      `OpenAI token exchange failed (${res.status}): ${errText.slice(0, 220)}`
+    );
+  }
+
+  const tokenData = (await res.json()) as Record<string, unknown>;
+  const accessToken = String(tokenData.access_token || '').trim();
+  const refreshToken = String(tokenData.refresh_token || '').trim();
+  if (!accessToken) {
+    throw new Error('OpenAI did not return an access token.');
+  }
+
+  const idClaims = decodeJwtClaims(
+    typeof tokenData.id_token === 'string' ? tokenData.id_token : null
+  );
+  const accessClaims = decodeJwtClaims(accessToken);
+  const email =
+    (typeof idClaims.email === 'string' && idClaims.email) ||
+    (typeof accessClaims.email === 'string' && accessClaims.email) ||
+    undefined;
+  const name =
+    (typeof idClaims.name === 'string' && idClaims.name) ||
+    (typeof accessClaims.name === 'string' && accessClaims.name) ||
+    undefined;
+  const expiresIn = Number(tokenData.expires_in) || 3600;
+
+  await savePendingChatGPTPkce(null);
+
+  return {
+    connected: true,
+    accessToken,
+    refreshToken,
+    clientId: effectiveClientId,
+    extAgentHostId: pending.extAgentHostId,
+    expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
+    scope:
+      (typeof tokenData.scope === 'string' && tokenData.scope) ||
+      params.scope ||
+      OPENAI_SCOPES,
+    email,
+    name,
+  };
+}
+
+export async function cancelPendingChatGPTSignIn(): Promise<void> {
+  await savePendingChatGPTPkce(null);
+}
+
+/**
+ * Launches "Sign in with ChatGPT":
+ * - If a local Companion Server happens to be online (e.g. desktop dev), uses automatic loopback.
+ * - Otherwise runs 100% serverless on-device PKCE directly on your iPhone / device (no hosting needed).
+ */
+export async function startChatGPTSignIn(
+  auth: ProviderAuthConfig
+): Promise<ChatGPTSignInResult> {
+  const companionProbe = await probeCompanionQuickly(
+    auth.companionUrl,
+    auth.companionToken,
+    1000
+  );
+
+  if (companionProbe?.ok) {
+    const st = await runCompanionBrowserOAuthFlow({
+      companionUrl: auth.companionUrl,
+      companionToken: auth.companionToken,
+      startPath: '/api/oauth/openai/start',
+      hostOpenPath: '/api/oauth/openai/open-on-host',
+      providerKey: 'gpt',
+      isConnected: (s) => Boolean(s.chatgptOAuth?.connected),
+    });
+    return { mode: 'companion_connected', companionStatus: st };
+  }
+
+  // Serverless On-Device PKCE Flow (no Companion backend required)
+  const authUrl = await buildOnDeviceOpenAIAuthorizeUrl(auth);
+
+  if (Platform.OS === 'web' && typeof window !== 'undefined') {
+    window.open(authUrl, '_blank', 'noopener,noreferrer');
+    return { mode: 'awaiting_callback', authUrl };
+  }
+
+  await WebBrowser.openBrowserAsync(authUrl, {
+    presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+  });
+
+  // Automatically complete if user copied the 127.0.0.1 callback URL before tapping Done
+  try {
+    const clip = (await Clipboard.getStringAsync()).trim();
+    if (looksLikeOAuthCallbackInput(clip)) {
+      const session = await completeOnDeviceChatGPTCallback(clip, auth);
+      return { mode: 'on_device_connected', session };
+    }
+  } catch {
+    // If clipboard wasn't copied yet, let user tap Complete from Clipboard
+  }
+
+  return { mode: 'awaiting_callback', authUrl };
+}
+
+/**
+ * Serverless 8-character Device Code Sign-In (https://auth.openai.com/codex/device).
+ * Copies the one-time code to clipboard, opens Safari, polls in background, and auto-closes Safari.
+ */
+export async function startChatGPTDeviceCodeSignIn(
+  auth: ProviderAuthConfig,
+  onCodeIssued: (info: { userCode: string; verificationUrl: string }) => void,
+  signal?: AbortSignal
+): Promise<{ session: ChatGPTOnDeviceSession; apiKeyIssued?: string }> {
+  const ucRes = await fetch(OPENAI_DEVICE_USERCODE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: OPENAI_CODEX_CLIENT_ID }),
+    signal,
+  });
+
+  if (ucRes.status === 404) {
+    throw new Error(
+      'Enable "Device code authorization" in ChatGPT Settings → Security first, or use Sign in with ChatGPT above.'
+    );
+  }
+  if (!ucRes.ok) {
+    throw new Error(
+      `Could not request ChatGPT sign-in code (${ucRes.status}). Use Sign in with ChatGPT or Keys ↗.`
+    );
+  }
+
+  const ucJson = (await ucRes.json()) as Record<string, unknown>;
+  const deviceAuthId = String(ucJson.device_auth_id || '').trim();
+  const userCode = String(ucJson.user_code || ucJson.usercode || '').trim();
+  const intervalSec = Math.max(4, Number(ucJson.interval) || 5);
+
+  if (!deviceAuthId || !userCode) {
+    throw new Error('Unexpected response from OpenAI device authorization.');
+  }
+
+  try {
+    await Clipboard.setStringAsync(userCode);
+  } catch {
+    // ignore clipboard write restrictions
+  }
+
+  onCodeIssued({
+    userCode,
+    verificationUrl: OPENAI_DEVICE_VERIFY_URL,
+  });
+
+  // Open verification page without blocking background token polling
+  if (Platform.OS === 'web' && typeof window !== 'undefined') {
+    window.open(OPENAI_DEVICE_VERIFY_URL, '_blank', 'noopener,noreferrer');
+  } else {
+    void WebBrowser.openBrowserAsync(OPENAI_DEVICE_VERIFY_URL, {
+      presentationStyle: WebBrowser.WebBrowserPresentationStyle.PAGE_SHEET,
+    }).catch(() => {});
+  }
+
+  const deadline = Date.now() + 10 * 60 * 1000;
+  let authCode = '';
+  let codeVerifier = '';
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      throw new Error('Sign-in cancelled.');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalSec * 1000));
+    if (signal?.aborted) {
+      throw new Error('Sign-in cancelled.');
+    }
+
+    const pollRes = await fetch(OPENAI_DEVICE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        device_auth_id: deviceAuthId,
+        user_code: userCode,
+      }),
+      signal,
+    });
+
+    if (pollRes.ok) {
+      const codeData = (await pollRes.json()) as Record<string, unknown>;
+      authCode = String(codeData.authorization_code || '').trim();
+      codeVerifier = String(codeData.code_verifier || '').trim();
+      break;
+    }
+
+    if (pollRes.status === 403 || pollRes.status === 404) {
+      continue;
+    }
+
+    throw new Error(`Device code sign-in failed (${pollRes.status}).`);
+  }
+
+  if (!authCode || !codeVerifier) {
+    throw new Error('Device code sign-in timed out. Please try again.');
+  }
+
+  const tokenRes = await fetch(OPENAI_CODEX_OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: encodeFormBody({
+      grant_type: 'authorization_code',
+      client_id: OPENAI_CODEX_CLIENT_ID,
+      code: authCode,
+      redirect_uri: OPENAI_DEVICE_CALLBACK_URI,
+      code_verifier: codeVerifier,
+    }),
+    signal,
+  });
+
+  if (!tokenRes.ok) {
+    const txt = await tokenRes.text();
+    throw new Error(`Token exchange failed (${tokenRes.status}): ${txt.slice(0, 180)}`);
+  }
+
+  const tokenData = (await tokenRes.json()) as Record<string, unknown>;
+  const accessToken = String(tokenData.access_token || '').trim();
+  const refreshToken = String(tokenData.refresh_token || '').trim();
+  const idToken = String(tokenData.id_token || '').trim();
+
+  if (Platform.OS === 'ios') {
+    try {
+      await WebBrowser.dismissBrowser();
+    } catch {
+      // ignore if already closed by user
+    }
+  }
+
+  // Attempt optional OpenAI API key token-exchange when workspace supports it
+  let apiKeyIssued: string | undefined;
+  if (idToken) {
+    try {
+      const exRes = await fetch(OPENAI_CODEX_OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: encodeFormBody({
+          grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+          client_id: OPENAI_CODEX_CLIENT_ID,
+          requested_token: 'openai-api-key',
+          subject_token: idToken,
+          subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
+        }),
+      });
+      if (exRes.ok) {
+        const exData = (await exRes.json()) as Record<string, unknown>;
+        const candidateKey = String(exData.access_token || '').trim();
+        if (candidateKey) {
+          apiKeyIssued = candidateKey;
+        }
+      }
+    } catch {
+      // Optional; continue with OAuth session tokens
+    }
+  }
+
+  const idClaims = decodeJwtClaims(idToken);
+  const accessClaims = decodeJwtClaims(accessToken);
+  const email =
+    (typeof idClaims.email === 'string' && idClaims.email) ||
+    (typeof accessClaims.email === 'string' && accessClaims.email) ||
+    undefined;
+  const name =
+    (typeof idClaims.name === 'string' && idClaims.name) ||
+    (typeof accessClaims.name === 'string' && accessClaims.name) ||
+    undefined;
+  const expiresIn = Number(tokenData.expires_in) || 3600;
+
+  const session: ChatGPTOnDeviceSession = {
+    connected: true,
+    accessToken,
+    refreshToken,
+    clientId: OPENAI_CODEX_CLIENT_ID,
+    extAgentHostId: ensureExtAgentHostId(auth.chatgptOAuth?.extAgentHostId),
+    expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
+    scope: typeof tokenData.scope === 'string' ? tokenData.scope : undefined,
+    email,
+    name,
+  };
+
+  return { session, apiKeyIssued };
 }
 
 export async function disconnectChatGPTOAuth(
   companionUrl: string,
   companionToken?: string
-): Promise<CompanionStatusResponse> {
+): Promise<CompanionStatusResponse | null> {
+  await savePendingChatGPTPkce(null);
   const baseUrl = normalizeBaseUrl(companionUrl);
-  await fetch(`${baseUrl}/api/oauth/openai/logout`, {
-    method: 'POST',
-    headers: buildCompanionHeaders(companionToken),
-  });
-  return checkCompanionStatus(baseUrl, companionToken);
+  try {
+    await fetch(`${baseUrl}/api/oauth/openai/logout`, {
+      method: 'POST',
+      headers: buildCompanionHeaders(companionToken),
+    });
+    return await checkCompanionStatus(baseUrl, companionToken);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -359,6 +934,16 @@ export function isProviderConfigured(
   }
 
   // gpt
+  if (
+    auth.chatgptOAuth?.connected &&
+    Boolean(auth.chatgptOAuth.accessToken || auth.chatgptOAuth.refreshToken)
+  ) {
+    const email = auth.chatgptOAuth.email;
+    return {
+      ready: true,
+      methodLabel: email ? `ChatGPT SSO (${email})` : 'ChatGPT SSO Connected',
+    };
+  }
   if (companionStatus?.ok && companionStatus.chatgptOAuth?.connected) {
     const email = companionStatus.chatgptOAuth.email;
     return {
@@ -726,6 +1311,98 @@ async function analyzeViaClaude(
   );
 }
 
+async function getValidOnDeviceChatGPTToken(
+  auth: ProviderAuthConfig
+): Promise<string | null> {
+  const session = auth.chatgptOAuth;
+  if (!session?.connected) return null;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (
+    session.accessToken &&
+    (!session.expiresAt || session.expiresAt - 60 > nowSec)
+  ) {
+    return session.accessToken;
+  }
+
+  if (session.refreshToken && session.clientId) {
+    try {
+      const isCodexClient = session.clientId === OPENAI_CODEX_CLIENT_ID;
+      const tokenUrl = isCodexClient
+        ? OPENAI_CODEX_OAUTH_TOKEN_URL
+        : OPENAI_TOKEN_URL;
+      const formFields: Record<string, string> = {
+        grant_type: 'refresh_token',
+        client_id: session.clientId,
+        refresh_token: session.refreshToken,
+      };
+      if (!isCodexClient) {
+        formFields.resource = OPENAI_RESOURCE;
+      }
+
+      const res = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: encodeFormBody(formFields),
+      });
+
+      if (res.ok) {
+        const tokenData = (await res.json()) as Record<string, unknown>;
+        const newAccess = String(tokenData.access_token || '').trim();
+        const newRefresh =
+          String(tokenData.refresh_token || '').trim() || session.refreshToken;
+        const expiresIn = Number(tokenData.expires_in) || 3600;
+
+        if (newAccess) {
+          const updatedSession: ChatGPTOnDeviceSession = {
+            ...session,
+            connected: true,
+            accessToken: newAccess,
+            refreshToken: newRefresh,
+            expiresAt: Math.floor(Date.now() / 1000) + expiresIn,
+          };
+          try {
+            const latestAuth = await loadAuthConfig();
+            await saveAuthConfig({
+              ...latestAuth,
+              chatgptOAuth: updatedSession,
+            });
+          } catch {
+            // Ignore background persistence race
+          }
+          return newAccess;
+        }
+      }
+    } catch {
+      // Fall back to existing accessToken if network refresh encountered a transient failure
+    }
+  }
+
+  return session.accessToken || null;
+}
+
+function extractOpenAIResponsesText(data: Record<string, unknown>): string {
+  if (typeof data.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text;
+  }
+  const chunks: string[] = [];
+  if (Array.isArray(data.output)) {
+    for (const item of data.output) {
+      if (!item || typeof item !== 'object') continue;
+      const contentArr = (item as Record<string, unknown>).content;
+      if (!Array.isArray(contentArr)) continue;
+      for (const part of contentArr) {
+        if (!part || typeof part !== 'object') continue;
+        const textVal = (part as Record<string, unknown>).text;
+        if (typeof textVal === 'string') {
+          chunks.push(textVal);
+        }
+      }
+    }
+  }
+  return chunks.join('');
+}
+
 async function analyzeViaGpt(
   auth: ProviderAuthConfig,
   imageBase64?: string,
@@ -733,7 +1410,7 @@ async function analyzeViaGpt(
   userNotes?: string,
   mealType?: MealType
 ): Promise<AIMealAnalysisResult> {
-  // 1. Direct OpenAI API key when explicitly entered on-device
+  // 1. Direct OpenAI API key when entered on-device (or issued via Device Code token exchange)
   if (auth.openaiApiKey.trim()) {
     const model = auth.gptModel || 'gpt-4o';
     const userContent: Record<string, unknown>[] = [
@@ -777,19 +1454,81 @@ async function analyzeViaGpt(
     return normalizeAnalysisPayload(parsed, 'gpt', model);
   }
 
-  // 2. Companion Server (uses official "Sign in with ChatGPT" OAuth session or server OPENAI_API_KEY)
+  // 2. Direct On-Device "Sign in with ChatGPT" OAuth session (no server hosting needed)
+  if (auth.chatgptOAuth?.connected) {
+    const oauthToken = await getValidOnDeviceChatGPTToken(auth);
+    if (oauthToken) {
+      const model = auth.gptModel || 'gpt-4o';
+      const responsesContent: Record<string, unknown>[] = [
+        {
+          type: 'input_text',
+          text: buildUserPrompt(mealType, userNotes, Boolean(imageBase64)),
+        },
+      ];
+      if (imageBase64) {
+        responsesContent.push({
+          type: 'input_image',
+          image_url: `data:${mimeType};base64,${imageBase64}`,
+          detail: 'auto',
+        });
+      }
+
+      const res = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${oauthToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          instructions: NUTRITION_SYSTEM_PROMPT,
+          input: [{ role: 'user', content: responsesContent }],
+          text: { format: { type: 'json_object' } },
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        if (res.status === 401 || res.status === 403) {
+          throw new Error(
+            `OpenAI authorization (${res.status}): Direct ChatGPT token inference requires an eligible ChatGPT Plus/Pro plan or an OpenAI key (tap Keys ↗ in Settings).`
+          );
+        }
+        throw new Error(
+          `OpenAI Responses API error (${res.status}): ${errText.slice(0, 240)}`
+        );
+      }
+
+      const data = (await res.json()) as Record<string, unknown>;
+      const content = extractOpenAIResponsesText(data);
+      const parsed = extractJsonFromText(content);
+      return normalizeAnalysisPayload(parsed, 'gpt', model);
+    }
+  }
+
+  // 3. Optional Companion Server if reachable on desktop / LAN
   if (auth.companionUrl.trim()) {
-    return callCompanionAnalyze(auth, {
-      provider: 'gpt',
-      imageBase64,
-      mimeType,
-      userNotes,
-      mealType,
-      model: auth.gptModel,
-    });
+    const probe = await probeCompanionQuickly(
+      auth.companionUrl,
+      auth.companionToken,
+      1200
+    );
+    if (
+      probe?.ok &&
+      (probe.chatgptOAuth?.connected || probe.serverProviders?.gpt)
+    ) {
+      return callCompanionAnalyze(auth, {
+        provider: 'gpt',
+        imageBase64,
+        mimeType,
+        userNotes,
+        mealType,
+        model: auth.gptModel,
+      });
+    }
   }
 
   throw new Error(
-    'GPT is not signed in yet. Open Settings to Sign in with ChatGPT (OpenAI SSO) or authorize an OpenAI key.'
+    'GPT is not signed in yet. Open Settings and tap "Sign in with ChatGPT" or paste an OpenAI key.'
   );
 }

@@ -3,7 +3,7 @@
     "name": "Plate",
     "slug": "calorie-tracker",
     "scheme": "calorietracker",
-    "version": "1.1.0",
+    "version": "1.1.2",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -14,7 +14,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.calorielens.tracker",
-      "buildNumber": "2",
+      "buildNumber": "4",
       "config": {
         "usesNonExemptEncryption": false
       },
@@ -25,9 +25,9 @@
     },
     "android": {
       "package": "com.calorielens.tracker",
-      "versionCode": 2,
+      "versionCode": 4,
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#121216",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -39,6 +39,13 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Plate uses your camera to take photos of your meals and analyze calories and macros.",
+          "recordAudioAndroid": false
+        }
+      ],
       "expo-sqlite",
       "expo-secure-store",
       "expo-web-browser",

@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import { Directory, File, Paths } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 import * as SQLite from 'expo-sqlite';
 import { Platform } from 'react-native';
@@ -9,6 +10,7 @@ import {
 } from '../constants/plateCatalog';
 import {
   AppPreferences,
+  ChatGPTOnDeviceSession,
   DailySummary,
   MealEntry,
   MealItem,
@@ -16,6 +18,16 @@ import {
   UserGoals,
   UserProfile,
 } from '../types/models';
+
+export interface PendingChatGPTPkceFlow {
+  state: string;
+  codeVerifier: string;
+  nonce: string;
+  redirectUri: string;
+  clientIdSent: string;
+  extAgentHostId: string;
+  createdAt: number;
+}
 
 export const DEFAULT_GOALS: UserGoals = DEFAULT_PLATE_GOALS;
 
@@ -52,7 +64,42 @@ const SECURE_KEYS = {
   claudeApiKey: 'cl_claude_api_key',
   openaiApiKey: 'cl_openai_api_key',
   geminiApiKey: 'cl_gemini_api_key',
+  chatgptAccessToken: 'cl_oai_oauth_access',
+  chatgptRefreshToken: 'cl_oai_oauth_refresh',
+  settingsMirror: 'cl_settings_mirror_v1',
 } as const;
+
+const SETTINGS_MIRROR_FILENAME = 'plate-settings-mirror.json';
+
+const MIRRORED_SETTING_KEYS = [
+  'user_goals',
+  'user_profile',
+  'app_preferences',
+  'provider_prefs',
+  'onboarding_completed',
+  'has_seeded_demo',
+  'purged_legacy_demo_seed_v1',
+] as const;
+
+const MIRRORED_KEY_SET = new Set<string>(MIRRORED_SETTING_KEYS);
+
+export interface PlatePortableBackup {
+  schema: 'plate-backup-v1';
+  exportedAt: string;
+  goals: UserGoals;
+  profile: UserProfile;
+  preferences: AppPreferences;
+  authPreferences: {
+    activeProvider: ProviderAuthConfig['activeProvider'];
+    companionUrl: string;
+    claudeModel: string;
+    gptModel: string;
+    geminiModel: string;
+  };
+  waterByDate: Record<string, number>;
+  stepsByDate: Record<string, number>;
+  meals: MealEntry[];
+}
 
 let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
 
@@ -140,6 +187,33 @@ function serializeItemsAndMeta(meal: MealEntry): string {
   return JSON.stringify(envelope);
 }
 
+function resolveStoredPhotoUri(rawUri: string | null | undefined): string | null {
+  if (!rawUri) return null;
+  if (Platform.OS === 'web') return rawUri;
+
+  // iOS assigns a fresh sandbox container UUID on each .ipa update.
+  // Re-anchor meal-photos filenames to the current Paths.document directory.
+  const marker = '/meal-photos/';
+  const idx = rawUri.lastIndexOf(marker);
+  if (idx >= 0) {
+    const fileName = rawUri.slice(idx + marker.length).split('?')[0];
+    if (fileName) {
+      try {
+        const currentFile = new File(
+          new Directory(Paths.document, 'meal-photos'),
+          fileName
+        );
+        if (currentFile.exists) {
+          return currentFile.uri;
+        }
+      } catch {
+        // fall back to stored URI
+      }
+    }
+  }
+  return rawUri;
+}
+
 function rowToMeal(row: MealRow): MealEntry {
   let items: MealItem[] = [];
   let meta: StoredMealEnvelope['meta'] = {};
@@ -161,7 +235,7 @@ function rowToMeal(row: MealRow): MealEntry {
     createdAt: row.created_at,
     mealType: row.meal_type as MealEntry['mealType'],
     title: row.title,
-    photoUri: row.photo_uri,
+    photoUri: resolveStoredPhotoUri(row.photo_uri),
     userNotes: row.user_notes || undefined,
     aiProvider: (row.ai_provider as MealEntry['aiProvider']) || undefined,
     aiSummary: row.ai_summary || undefined,
@@ -182,13 +256,132 @@ function rowToMeal(row: MealRow): MealEntry {
   };
 }
 
+let mirrorCache: Record<string, string> | null = null;
+let mirrorLoadPromise: Promise<Record<string, string>> | null = null;
+
+function compactMirrorForKeychain(
+  fullMap: Record<string, string>
+): Record<string, string> {
+  const copy: Record<string, string> = { ...fullMap };
+  if (copy.user_profile) {
+    try {
+      const prof = JSON.parse(copy.user_profile) as UserProfile;
+      if (Array.isArray(prof.weightHistory) && prof.weightHistory.length > 36) {
+        copy.user_profile = JSON.stringify({
+          ...prof,
+          weightHistory: prof.weightHistory.slice(-36),
+        });
+      }
+    } catch {
+      // keep raw
+    }
+  }
+  return copy;
+}
+
+async function readDocumentMirrorFile(): Promise<Record<string, string>> {
+  if (Platform.OS === 'web') return {};
+  try {
+    const file = new File(Paths.document, SETTINGS_MIRROR_FILENAME);
+    if (!file.exists) return {};
+    const txt = await file.text();
+    if (!txt) return {};
+    const parsed = JSON.parse(txt);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeDocumentMirrorFile(
+  map: Record<string, string>
+): Promise<void> {
+  if (Platform.OS === 'web') return;
+  try {
+    const file = new File(Paths.document, SETTINGS_MIRROR_FILENAME);
+    file.create({ intermediates: true, overwrite: true });
+    await file.write(JSON.stringify(map));
+  } catch {
+    // ignore file mirror errors
+  }
+}
+
+async function loadSettingsMirrorMap(): Promise<Record<string, string>> {
+  if (mirrorCache) return mirrorCache;
+  if (!mirrorLoadPromise) {
+    mirrorLoadPromise = (async () => {
+      const [docMap, keychainRaw] = await Promise.all([
+        readDocumentMirrorFile(),
+        getChunkedSecret(SECURE_KEYS.settingsMirror),
+      ]);
+      let keychainMap: Record<string, string> = {};
+      if (keychainRaw) {
+        try {
+          const parsed = JSON.parse(keychainRaw);
+          if (parsed && typeof parsed === 'object') {
+            keychainMap = parsed as Record<string, string>;
+          }
+        } catch {
+          keychainMap = {};
+        }
+      }
+      // Document file preserves full history on in-place updates;
+      // iOS Keychain survives even uninstall + reinstall under the same bundle ID.
+      const merged: Record<string, string> = {
+        ...keychainMap,
+        ...docMap,
+      };
+      mirrorCache = merged;
+      return merged;
+    })();
+  }
+  return mirrorLoadPromise;
+}
+
+async function persistSettingsMirrorKey(
+  key: string,
+  value: string
+): Promise<void> {
+  const current = await loadSettingsMirrorMap();
+  const next: Record<string, string> = { ...current, [key]: value };
+  mirrorCache = next;
+  await Promise.all([
+    writeDocumentMirrorFile(next),
+    setChunkedSecret(
+      SECURE_KEYS.settingsMirror,
+      JSON.stringify(compactMirrorForKeychain(next))
+    ),
+  ]);
+}
+
 async function getSettingValue(key: string): Promise<string | null> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ value: string }>(
     'SELECT value FROM app_settings WHERE key = ?',
     [key]
   );
-  return row?.value ?? null;
+  if (row?.value !== undefined && row?.value !== null) {
+    return row.value;
+  }
+
+  if (MIRRORED_KEY_SET.has(key)) {
+    const mirror = await loadSettingsMirrorMap();
+    const recovered = mirror[key];
+    if (typeof recovered === 'string' && recovered.length > 0) {
+      // Self-heal SQLite from Document / Keychain mirror after update or reinstall
+      try {
+        await db.runAsync(
+          'INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)',
+          [key, recovered]
+        );
+      } catch {
+        // ignore self-heal write race
+      }
+      return recovered;
+    }
+  }
+
+  return null;
 }
 
 async function setSettingValue(key: string, value: string): Promise<void> {
@@ -197,6 +390,48 @@ async function setSettingValue(key: string, value: string): Promise<void> {
     'INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)',
     [key, value]
   );
+  try {
+    await db.execAsync('PRAGMA wal_checkpoint(PASSIVE);');
+  } catch {
+    // ignore passive checkpoint warning
+  }
+  if (MIRRORED_KEY_SET.has(key)) {
+    await persistSettingsMirrorKey(key, value);
+  }
+}
+
+/**
+ * Ensures any pre-existing SQLite settings from an earlier version of Plate
+ * are backed up into the Documents JSON mirror + iOS Keychain mirror on launch.
+ */
+export async function ensureSettingsMirrored(): Promise<void> {
+  try {
+    const db = await getDb();
+    const rows = await db.getAllAsync<{ key: string; value: string }>(
+      'SELECT key, value FROM app_settings'
+    );
+    const current = await loadSettingsMirrorMap();
+    let changed = false;
+    const next: Record<string, string> = { ...current };
+    for (const r of rows) {
+      if (MIRRORED_KEY_SET.has(r.key) && r.value && next[r.key] !== r.value) {
+        next[r.key] = r.value;
+        changed = true;
+      }
+    }
+    if (changed) {
+      mirrorCache = next;
+      await Promise.all([
+        writeDocumentMirrorFile(next),
+        setChunkedSecret(
+          SECURE_KEYS.settingsMirror,
+          JSON.stringify(compactMirrorForKeychain(next))
+        ),
+      ]);
+    }
+  } catch {
+    // non-fatal background mirror sync
+  }
 }
 
 export async function loadAllMeals(): Promise<MealEntry[]> {
@@ -389,6 +624,19 @@ export async function saveHasSeededDemo(seeded: boolean): Promise<void> {
   await setSettingValue('has_seeded_demo', seeded ? 'true' : 'false');
 }
 
+export async function loadHasPurgedLegacyDemoSeed(): Promise<boolean> {
+  return (await getSettingValue('purged_legacy_demo_seed_v1')) === 'true';
+}
+
+export async function saveHasPurgedLegacyDemoSeed(
+  purged: boolean
+): Promise<void> {
+  await setSettingValue(
+    'purged_legacy_demo_seed_v1',
+    purged ? 'true' : 'false'
+  );
+}
+
 async function getSecret(key: string): Promise<string> {
   try {
     return (await SecureStore.getItemAsync(key)) || '';
@@ -409,11 +657,36 @@ async function setSecret(key: string, value: string): Promise<void> {
   }
 }
 
+const CHUNK_SIZE = 1600;
+const MAX_CHUNKS = 4;
+
+async function getChunkedSecret(baseKey: string): Promise<string> {
+  const parts: string[] = [];
+  for (let i = 0; i < MAX_CHUNKS; i += 1) {
+    const chunk = await getSecret(`${baseKey}_${i}`);
+    if (!chunk) break;
+    parts.push(chunk);
+  }
+  return parts.join('');
+}
+
+async function setChunkedSecret(baseKey: string, value: string): Promise<void> {
+  for (let i = 0; i < MAX_CHUNKS; i += 1) {
+    const slice = value ? value.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE) : '';
+    await setSecret(`${baseKey}_${i}`, slice);
+  }
+}
+
 export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
   const defaults = getDefaultAuthConfig();
   const raw = await getSettingValue('provider_prefs');
 
-  let prefs: Partial<ProviderAuthConfig> = {};
+  let prefs: Partial<ProviderAuthConfig> & {
+    chatgptOAuthMeta?: Omit<
+      ChatGPTOnDeviceSession,
+      'accessToken' | 'refreshToken'
+    >;
+  } = {};
   if (raw) {
     try {
       prefs = JSON.parse(raw);
@@ -422,32 +695,86 @@ export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
     }
   }
 
-  const [companionToken, claudeApiKey, openaiApiKey, geminiApiKey] =
-    await Promise.all([
-      getSecret(SECURE_KEYS.companionToken),
-      getSecret(SECURE_KEYS.claudeApiKey),
-      getSecret(SECURE_KEYS.openaiApiKey),
-      getSecret(SECURE_KEYS.geminiApiKey),
-    ]);
-
-  return {
-    ...defaults,
-    ...prefs,
-    companionUrl: prefs.companionUrl || defaults.companionUrl,
+  const [
     companionToken,
     claudeApiKey,
     openaiApiKey,
     geminiApiKey,
+    chatgptAccessToken,
+    chatgptRefreshToken,
+  ] = await Promise.all([
+    getSecret(SECURE_KEYS.companionToken),
+    getSecret(SECURE_KEYS.claudeApiKey),
+    getSecret(SECURE_KEYS.openaiApiKey),
+    getSecret(SECURE_KEYS.geminiApiKey),
+    getChunkedSecret(SECURE_KEYS.chatgptAccessToken),
+    getChunkedSecret(SECURE_KEYS.chatgptRefreshToken),
+  ]);
+
+  const meta = prefs.chatgptOAuthMeta;
+  const hasTokens = Boolean(chatgptAccessToken || chatgptRefreshToken);
+  const isChatGptConnected = meta
+    ? Boolean(meta.connected && hasTokens)
+    : hasTokens;
+  const chatgptOAuth: ChatGPTOnDeviceSession | undefined =
+    meta || hasTokens
+      ? {
+          connected: isChatGptConnected,
+          accessToken: chatgptAccessToken,
+          refreshToken: chatgptRefreshToken,
+          clientId: meta?.clientId || '',
+          extAgentHostId: meta?.extAgentHostId || '',
+          expiresAt: meta?.expiresAt || 0,
+          scope: meta?.scope,
+          email: meta?.email,
+          name: meta?.name,
+        }
+      : undefined;
+
+  const inferredProvider: ProviderAuthConfig['activeProvider'] =
+    prefs.activeProvider ||
+    (isChatGptConnected || openaiApiKey
+      ? 'gpt'
+      : claudeApiKey
+        ? 'claude'
+        : defaults.activeProvider);
+
+  return {
+    ...defaults,
+    activeProvider: inferredProvider,
+    companionUrl: prefs.companionUrl || defaults.companionUrl,
+    claudeModel: prefs.claudeModel || defaults.claudeModel,
+    gptModel: prefs.gptModel || defaults.gptModel,
+    geminiModel: prefs.geminiModel || defaults.geminiModel,
+    companionToken,
+    claudeApiKey,
+    openaiApiKey,
+    geminiApiKey,
+    chatgptOAuth,
   };
 }
 
 export async function saveAuthConfig(config: ProviderAuthConfig): Promise<void> {
+  const oai = config.chatgptOAuth;
   const nonSecretPrefs = {
     activeProvider: config.activeProvider,
     companionUrl: config.companionUrl,
     claudeModel: config.claudeModel,
     gptModel: config.gptModel,
     geminiModel: config.geminiModel,
+    chatgptOAuthMeta: oai
+      ? {
+          connected: Boolean(
+            oai.connected && (oai.accessToken || oai.refreshToken)
+          ),
+          clientId: oai.clientId || '',
+          extAgentHostId: oai.extAgentHostId || '',
+          expiresAt: oai.expiresAt || 0,
+          scope: oai.scope,
+          email: oai.email,
+          name: oai.name,
+        }
+      : undefined,
   };
 
   await setSettingValue('provider_prefs', JSON.stringify(nonSecretPrefs));
@@ -457,7 +784,42 @@ export async function saveAuthConfig(config: ProviderAuthConfig): Promise<void> 
     setSecret(SECURE_KEYS.claudeApiKey, config.claudeApiKey),
     setSecret(SECURE_KEYS.openaiApiKey, config.openaiApiKey),
     setSecret(SECURE_KEYS.geminiApiKey, config.geminiApiKey),
+    setChunkedSecret(
+      SECURE_KEYS.chatgptAccessToken,
+      oai?.connected ? oai.accessToken : ''
+    ),
+    setChunkedSecret(
+      SECURE_KEYS.chatgptRefreshToken,
+      oai?.connected ? oai.refreshToken : ''
+    ),
   ]);
+}
+
+export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow | null> {
+  const raw = await getSettingValue('pending_chatgpt_pkce');
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as PendingChatGPTPkceFlow;
+    if (
+      !parsed?.state ||
+      !parsed?.codeVerifier ||
+      Date.now() - (parsed.createdAt || 0) > 20 * 60 * 1000
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePendingChatGPTPkce(
+  flow: PendingChatGPTPkceFlow | null
+): Promise<void> {
+  await setSettingValue(
+    'pending_chatgpt_pkce',
+    flow ? JSON.stringify(flow) : ''
+  );
 }
 
 export async function loadOnboardingCompleted(): Promise<boolean> {
@@ -468,4 +830,134 @@ export async function saveOnboardingCompleted(
   completed: boolean
 ): Promise<void> {
   await setSettingValue('onboarding_completed', completed ? 'true' : 'false');
+}
+
+/**
+ * Detects whether the user already has saved settings, preferences, goals, profile,
+ * or AI credentials from a previous version/install so app updates keep their setup
+ * and never force them back through first-time onboarding.
+ */
+export async function hasStoredUserConfiguration(): Promise<boolean> {
+  const [goalsRaw, prefsRaw, profileRaw, providerRaw, onboardRaw] =
+    await Promise.all([
+      getSettingValue('user_goals'),
+      getSettingValue('app_preferences'),
+      getSettingValue('user_profile'),
+      getSettingValue('provider_prefs'),
+      getSettingValue('onboarding_completed'),
+    ]);
+
+  if (
+    onboardRaw === 'true' ||
+    Boolean(goalsRaw || prefsRaw || profileRaw || providerRaw)
+  ) {
+    return true;
+  }
+
+  const [claudeKey, openaiKey, geminiKey, oaiAccess, oaiRefresh] =
+    await Promise.all([
+      getSecret(SECURE_KEYS.claudeApiKey),
+      getSecret(SECURE_KEYS.openaiApiKey),
+      getSecret(SECURE_KEYS.geminiApiKey),
+      getChunkedSecret(SECURE_KEYS.chatgptAccessToken),
+      getChunkedSecret(SECURE_KEYS.chatgptRefreshToken),
+    ]);
+
+  return Boolean(
+    claudeKey || openaiKey || geminiKey || oaiAccess || oaiRefresh
+  );
+}
+
+export async function createPortableBackupJson(): Promise<string> {
+  const [goals, profile, preferences, auth, waterByDate, stepsByDate, meals] =
+    await Promise.all([
+      loadGoals(),
+      loadUserProfile(),
+      loadPreferences(),
+      loadAuthConfig(),
+      loadWaterByDate(),
+      loadStepsByDate(),
+      loadAllMeals(),
+    ]);
+
+  const payload: PlatePortableBackup = {
+    schema: 'plate-backup-v1',
+    exportedAt: new Date().toISOString(),
+    goals,
+    profile,
+    preferences,
+    authPreferences: {
+      activeProvider: auth.activeProvider,
+      companionUrl: auth.companionUrl,
+      claudeModel: auth.claudeModel,
+      gptModel: auth.gptModel,
+      geminiModel: auth.geminiModel,
+    },
+    waterByDate,
+    stepsByDate,
+    meals,
+  };
+
+  return JSON.stringify(payload, null, 2);
+}
+
+export async function restorePortableBackupJson(rawJson: string): Promise<{
+  goals: UserGoals;
+  profile: UserProfile;
+  preferences: AppPreferences;
+  auth: ProviderAuthConfig;
+  waterByDate: Record<string, number>;
+  stepsByDate: Record<string, number>;
+  meals: MealEntry[];
+}> {
+  const parsed = JSON.parse(rawJson.trim()) as Partial<PlatePortableBackup>;
+  if (!parsed || parsed.schema !== 'plate-backup-v1') {
+    throw new Error('Clipboard does not contain a valid Plate backup JSON.');
+  }
+
+  const currentAuth = await loadAuthConfig();
+  const nextGoals: UserGoals = { ...DEFAULT_GOALS, ...(parsed.goals || {}) };
+  const nextProfile: UserProfile = {
+    ...DEFAULT_USER_PROFILE,
+    ...(parsed.profile || {}),
+  };
+  const nextPreferences: AppPreferences = {
+    ...DEFAULT_PREFERENCES,
+    ...(parsed.preferences || {}),
+  };
+  const nextAuth: ProviderAuthConfig = {
+    ...currentAuth,
+    ...(parsed.authPreferences || {}),
+  };
+  const nextWater =
+    parsed.waterByDate && typeof parsed.waterByDate === 'object'
+      ? parsed.waterByDate
+      : {};
+  const nextSteps =
+    parsed.stepsByDate && typeof parsed.stepsByDate === 'object'
+      ? parsed.stepsByDate
+      : {};
+  const nextMeals = Array.isArray(parsed.meals) ? parsed.meals : [];
+
+  await Promise.all([
+    saveGoals(nextGoals),
+    saveUserProfile(nextProfile),
+    savePreferences(nextPreferences),
+    saveAuthConfig(nextAuth),
+    saveWaterByDate(nextWater),
+    saveStepsByDate(nextSteps),
+    replaceAllMeals(nextMeals),
+    saveOnboardingCompleted(true),
+    saveHasSeededDemo(true),
+  ]);
+
+  return {
+    goals: nextGoals,
+    profile: nextProfile,
+    preferences: nextPreferences,
+    auth: nextAuth,
+    waterByDate: nextWater,
+    stepsByDate: nextSteps,
+    meals: nextMeals,
+  };
 }
