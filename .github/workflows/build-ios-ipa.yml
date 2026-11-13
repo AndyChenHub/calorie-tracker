@@ -84,9 +84,14 @@ jobs:
           CI: '1'
           NODE_ENV: production
         run: |
+          PROJECT=$(ls -d ios/*.xcodeproj | head -n 1)
           WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
-          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | jq -r '.workspace.schemes[] | select(. != "Pods" and (startswith("Pods-") | not))' | head -n 1)
-          echo "Building workspace=$WORKSPACE scheme=$SCHEME"
+          SCHEME=$(xcodebuild -project "$PROJECT" -list -json | jq -r '.project.schemes[0]')
+          if [ -z "$SCHEME" ] || [ "$SCHEME" = "null" ]; then
+            SCHEME=$(basename "$PROJECT" .xcodeproj)
+          fi
+          echo "Building workspace=$WORKSPACE project=$PROJECT scheme=$SCHEME"
+          echo "APP_SCHEME=${SCHEME}" >> "$GITHUB_ENV"
 
           xcodebuild \
             -workspace "$WORKSPACE" \
@@ -94,25 +99,34 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            -derivedDataPath ios/build \
+            -derivedDataPath "$PWD/ios/build" \
+            NODE_BINARY="$(command -v node)" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             build
 
       - name: Package Payload into .ipa
         id: package_ipa
         run: |
-          APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          APP_PATH=$(find "$PWD/ios/build" -type d -path "*/Release-iphoneos/${APP_SCHEME}.app" | head -n 1)
           if [ -z "$APP_PATH" ]; then
-            echo "::error::Compiled .app bundle was not found in ios/build/Build/Products/Release-iphoneos"
+            APP_PATH=$(find "$PWD/ios/build" -type d -name "*.app" ! -path "*/*.app/*" | head -n 1)
+          fi
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Compiled .app bundle was not found in $PWD/ios/build"
+            find "$PWD/ios/build" -maxdepth 4 || true
             exit 1
           fi
 
+          echo "Found compiled app bundle: $APP_PATH"
           if [ ! -f "$APP_PATH/main.jsbundle" ]; then
             echo "::error::main.jsbundle missing inside $APP_PATH — Release JS bundle was not embedded"
+            ls -la "$APP_PATH" || true
             exit 1
           fi
 
