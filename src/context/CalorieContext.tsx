@@ -235,6 +235,28 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         let initialMeals = loadedMeals;
         let initialWater = loadedWater;
         let initialSteps = loadedSteps;
+        let initialProfile = loadedProfile;
+
+        // Clean up legacy hardcoded 84.6 -> 78.4 kg demo profile gap if no real weight history exists
+        if (
+          initialProfile.startWeightKg === 84.6 &&
+          (!initialProfile.weightHistory ||
+            initialProfile.weightHistory.length === 0)
+        ) {
+          if (
+            initialProfile.weightKg === 78.4 &&
+            initialProfile.goalWeightKg === 72 &&
+            initialProfile.name === 'Alex Morgan'
+          ) {
+            initialProfile = { ...DEFAULT_USER_PROFILE };
+          } else {
+            initialProfile = {
+              ...initialProfile,
+              startWeightKg: initialProfile.weightKg,
+            };
+          }
+          await saveUserProfile(initialProfile);
+        }
 
         // Never seed sample meals/images on startup, and purge legacy auto-seeded demo data once on upgrade
         if (!purgedLegacyDemo) {
@@ -277,14 +299,14 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         void ensureSettingsMirrored();
 
         if (!mounted) return;
-        profileRef.current = loadedProfile;
+        profileRef.current = initialProfile;
         preferencesRef.current = loadedPrefs;
         authRef.current = loadedAuth;
         setMeals(initialMeals);
         setGoals(loadedGoals);
         setAuth(loadedAuth);
         setHasCompletedOnboarding(effectiveOnboarded);
-        setProfile(loadedProfile);
+        setProfile(initialProfile);
         setPreferences(loadedPrefs);
         setWaterByDate(initialWater);
         setStepsByDate(initialSteps);
@@ -670,8 +692,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     setWaterByDate({});
     setStepsByDate({});
     setDetailEntryId(null);
-    showToast('All logs cleared');
-  }, [showToast]);
+  }, []);
 
   const value = useMemo<CalorieContextValue>(
     () => ({

@@ -6,6 +6,7 @@ import {
   MealItem,
   UserGoals,
   UserProfile,
+  WeightLogPoint,
 } from '../types/models';
 import { inferMealTypeByHour, toLocalDateKey } from '../utils/date';
 
@@ -193,11 +194,11 @@ export const DEFAULT_PLATE_GOALS: UserGoals = {
 };
 
 export const DEFAULT_USER_PROFILE: UserProfile = {
-  name: 'Alex Morgan',
-  weightKg: 78.4,
-  goalWeightKg: 72,
-  startWeightKg: 84.6,
-  heightCm: 180,
+  name: 'You',
+  weightKg: 75,
+  goalWeightKg: 70,
+  startWeightKg: 75,
+  heightCm: 175,
   weightHistory: [],
 };
 
@@ -220,16 +221,6 @@ export function resolveMealImageSource(
     return { uri: meal.photoUri };
   }
   return null;
-}
-
-export function mulberry32(seed: number): () => number {
-  let a = seed | 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
 }
 
 function makeUid(): string {
@@ -317,17 +308,16 @@ export function computeHealthScoreFromMacros(
   return Math.max(1, Math.min(10, Math.round(score)));
 }
 
-export function buildWeightSeries(profile: UserProfile): number[] {
-  const rnd = mulberry32(7);
-  const n = 180;
-  const out: number[] = [];
-  let w = profile.startWeightKg;
-  for (let i = 0; i < n; i++) {
-    w += -0.036 + (rnd() - 0.5) * 0.38;
-    out.push(w);
-  }
-  const diff = profile.weightKg - out[n - 1];
-  return out.map((v, i) => v + diff * (i / (n - 1)));
+export function upsertWeightLogPoint(
+  history: WeightLogPoint[] | undefined,
+  dateKey: string,
+  weightKg: number
+): WeightLogPoint[] {
+  const rounded = Math.round(weightKg * 10) / 10;
+  const filtered = (history ?? []).filter((pt) => pt.dateKey !== dateKey);
+  filtered.push({ dateKey, weightKg: rounded });
+  filtered.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return filtered;
 }
 
 export function formatNum(n: number): string {

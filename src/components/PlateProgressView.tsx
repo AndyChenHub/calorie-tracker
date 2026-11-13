@@ -1,5 +1,5 @@
 import { LinearGradient } from 'expo-linear-gradient';
-import React, { useMemo, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Pressable,
   ScrollView,
@@ -7,7 +7,7 @@ import {
   Text,
   View,
 } from 'react-native';
-import { buildWeightSeries, formatNum } from '../constants/plateCatalog';
+import { formatNum } from '../constants/plateCatalog';
 import { useCalorieTracker } from '../context/CalorieContext';
 import { cardShadow, plateColors } from '../theme/colors';
 import { toLocalDateKey } from '../utils/date';
@@ -36,17 +36,15 @@ export function PlateProgressView({
 
   const todayKey = toLocalDateKey();
 
-  const weightSeries = useMemo(() => buildWeightSeries(profile), [profile]);
-
-  const totalSpan = Math.abs(profile.startWeightKg - profile.goalWeightKg);
-  const progressDone = Math.abs(profile.startWeightKg - profile.weightKg);
+  const rawSpan = profile.goalWeightKg - profile.startWeightKg;
+  const rawMoved = profile.weightKg - profile.startWeightKg;
+  const totalSpan = Math.abs(rawSpan);
   const progressPct =
     totalSpan > 0.05
-      ? Math.max(0, Math.min(100, Math.round((progressDone / totalSpan) * 100)))
+      ? Math.max(0, Math.min(100, Math.round((rawMoved / rawSpan) * 100)))
       : 100;
-  const weightDelta = Number(
-    Math.abs(profile.startWeightKg - profile.weightKg).toFixed(1)
-  );
+  const signedChange = Number(rawMoved.toFixed(1));
+  const weightHistory = profile.weightHistory ?? [];
 
   // Current Monday..Sunday week
   const now = new Date();
@@ -105,7 +103,7 @@ export function PlateProgressView({
             <Text style={styles.weightUnit}> kg</Text>
           </Text>
           <Text style={styles.goalLine}>
-            {'Goal '}
+            {`Start ${profile.startWeightKg} kg · Goal `}
             <Text style={styles.goalBold}>{`${profile.goalWeightKg} kg`}</Text>
           </Text>
           <View style={styles.progressTrack}>
@@ -168,9 +166,17 @@ export function PlateProgressView({
         <View style={styles.chartHeader}>
           <Text style={styles.chartTitle}>Goal progress</Text>
           <View style={styles.deltaBadge}>
-            <PlateIcon name="down" size={13} color={plateColors.ok} />
+            {Math.abs(signedChange) >= 0.1 ? (
+              <PlateIcon
+                name="down"
+                size={13}
+                color={plateColors.ok}
+              />
+            ) : null}
             <Text style={styles.deltaText}>
-              {`${weightDelta} kg · ${progressPct}% to goal`}
+              {Math.abs(signedChange) >= 0.1
+                ? `${signedChange > 0 ? '+' : ''}${signedChange.toFixed(1)} kg · ${progressPct}% to goal`
+                : `${progressPct}% to goal`}
             </Text>
           </View>
         </View>
@@ -204,10 +210,19 @@ export function PlateProgressView({
         </View>
 
         <WeightAreaChart
-          series={weightSeries}
-          range={range}
+          history={weightHistory}
+          currentWeight={profile.weightKg}
+          startWeight={profile.startWeightKg}
           goalWeight={profile.goalWeightKg}
+          range={range}
+          todayKey={todayKey}
         />
+
+        {weightHistory.length < 2 ? (
+          <Text style={styles.emptyHistoryHint}>
+            Log your weight over time to build your progress line.
+          </Text>
+        ) : null}
       </View>
 
       {/* This Week's Energy Stacked Bar Chart */}
@@ -477,6 +492,12 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: plateColors.ok,
     fontVariant: ['tabular-nums'],
+  },
+  emptyHistoryHint: {
+    fontSize: 12,
+    color: plateColors.muted,
+    textAlign: 'center',
+    marginTop: 6,
   },
   segmentedBar: {
     flexDirection: 'row',

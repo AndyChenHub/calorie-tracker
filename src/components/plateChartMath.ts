@@ -1,3 +1,5 @@
+import { WeightLogPoint } from '../types/models';
+
 export type PlateIconName =
   | 'flame'
   | 'plus'
@@ -48,9 +50,12 @@ export interface ProgressRingProps {
 }
 
 export interface WeightAreaChartProps {
-  series: number[];
-  range: 30 | 90 | 180;
+  history: WeightLogPoint[];
+  currentWeight: number;
+  startWeight: number;
   goalWeight: number;
+  range: 30 | 90 | 180;
+  todayKey: string;
 }
 
 export interface WeekBarDayPoint {
@@ -101,33 +106,58 @@ export function smoothCatmullBezier(pts: [number, number][]): string {
   return d;
 }
 
-export function computeWeightChartGeometry(
-  series: number[],
-  range: 30 | 90 | 180,
-  goalWeight: number
-) {
+function dateKeyToEpochDay(dateKey: string): number {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  if (!y || !m || !d) return 0;
+  return Math.floor(Date.UTC(y, m - 1, d) / 86400000);
+}
+
+export function computeWeightChartGeometry({
+  history,
+  currentWeight,
+  startWeight,
+  goalWeight,
+  range,
+  todayKey,
+}: WeightAreaChartProps) {
   const W = 318;
   const H = 170;
   const L = 30;
   const T = 12;
   const B = 22;
 
-  const data = series.slice(-range);
-  const step = Math.max(1, Math.floor(data.length / 28));
-  const sampled = data.filter((_, i) => i % step === 0 || i === data.length - 1);
-  const ptsVals = sampled.length >= 2 ? sampled : [goalWeight + 2, goalWeight];
+  const todayDay = dateKeyToEpochDay(todayKey);
+  const valid = (history ?? [])
+    .filter((pt) => pt && typeof pt.weightKg === 'number' && Boolean(pt.dateKey))
+    .map((pt) => ({
+      dayOffset: todayDay - dateKeyToEpochDay(pt.dateKey),
+      weightKg: pt.weightKg,
+    }))
+    .filter((pt) => pt.dayOffset >= 0 && pt.dayOffset <= range)
+    .sort((a, b) => b.dayOffset - a.dayOffset);
 
-  const mn = Math.floor(Math.min(...ptsVals, goalWeight) - 1);
-  const mx = Math.max(mn + 2, Math.ceil(Math.max(...ptsVals, goalWeight) + 1));
+  const pts =
+    valid.length > 0 ? valid : [{ dayOffset: 0, weightKg: currentWeight }];
 
-  const xOf = (i: number) =>
-    L + (i / Math.max(1, ptsVals.length - 1)) * (W - L - 8);
+  const allVals = [...pts.map((p) => p.weightKg), goalWeight, startWeight];
+  const mn = Math.floor(Math.min(...allVals) - 1.5);
+  const mx = Math.max(mn + 3, Math.ceil(Math.max(...allVals) + 1.5));
+
+  const xOfOffset = (dayOffset: number) =>
+    L + ((range - dayOffset) / range) * (W - L - 8);
   const yOf = (v: number) => T + (1 - (v - mn) / (mx - mn)) * (H - T - B);
 
-  const coords: [number, number][] = ptsVals.map((v, i) => [xOf(i), yOf(v)]);
-  const linePath = smoothCatmullBezier(coords);
-  const last = coords[coords.length - 1] || [L, H - B];
-  const areaPath = `${linePath} L${last[0].toFixed(2)},${H - B} L${L},${H - B} Z`;
+  const coords: [number, number][] = pts.map((p) => [
+    xOfOffset(p.dayOffset),
+    yOf(p.weightKg),
+  ]);
+  const hasTrendLine = coords.length >= 2;
+  const linePath = hasTrendLine ? smoothCatmullBezier(coords) : '';
+  const first = coords[0] || [W - 8, H - B];
+  const last = coords[coords.length - 1] || [W - 8, H - B];
+  const areaPath = hasTrendLine
+    ? `${linePath} L${last[0].toFixed(2)},${H - B} L${first[0].toFixed(2)},${H - B} Z`
+    : '';
 
   const gridLines = [0, 1, 2, 3].map((i) => {
     const val = mn + ((mx - mn) * i) / 3;
@@ -156,6 +186,7 @@ export function computeWeightChartGeometry(
     L,
     T,
     B,
+    hasTrendLine,
     linePath,
     areaPath,
     last,

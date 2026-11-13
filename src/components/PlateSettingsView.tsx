@@ -4,6 +4,7 @@ import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -54,7 +55,6 @@ export function PlateSettingsView({
     refreshCompanionStatus,
     clearAllLogs,
     exportBackupJson,
-    importBackupJson,
     showToast,
   } = useCalorieTracker();
 
@@ -72,12 +72,35 @@ export function PlateSettingsView({
   const [companionUrlDraft, setCompanionUrlDraft] = useState<string | null>(
     null
   );
+  const [clearTapCount, setClearTapCount] = useState(0);
+  const [clearedPopupOpen, setClearedPopupOpen] = useState(false);
+  const clearTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
       deviceCodeAbortRef.current?.abort();
+      if (clearTapTimerRef.current) {
+        clearTimeout(clearTapTimerRef.current);
+      }
     };
   }, []);
+
+  const handleClearMealsPress = async () => {
+    if (clearTapTimerRef.current) {
+      clearTimeout(clearTapTimerRef.current);
+    }
+    const next = clearTapCount + 1;
+    if (next >= 5) {
+      setClearTapCount(0);
+      await clearAllLogs();
+      setClearedPopupOpen(true);
+      return;
+    }
+    setClearTapCount(next);
+    clearTapTimerRef.current = setTimeout(() => {
+      setClearTapCount(0);
+    }, 4000);
+  };
 
   const initials = profile.name
     .split(' ')
@@ -848,42 +871,71 @@ export function PlateSettingsView({
           </Text>
         </Pressable>
         <Pressable
-          onPress={async () => {
-            try {
-              const clip = (await Clipboard.getStringAsync()).trim();
-              if (!clip) {
-                showToast('Copy a Plate backup JSON first');
-                return;
-              }
-              await importBackupJson(clip);
-              showToast('Restored settings, goals & logs!');
-            } catch (err) {
-              showToast(
-                err instanceof Error ? err.message : 'Invalid backup JSON'
-              );
-            }
-          }}
-          style={styles.actionRow}
-        >
-          <Text style={styles.actionRowText}>Restore backup from clipboard</Text>
-        </Pressable>
-        <Pressable
           onPress={() => router.push('/onboarding')}
           style={styles.actionRow}
         >
           <Text style={styles.actionRowText}>Open Initial Setup</Text>
         </Pressable>
         <Pressable
-          onPress={clearAllLogs}
-          style={[styles.actionRow, { borderBottomWidth: 0 }]}
+          onPress={() => void handleClearMealsPress()}
+          style={({ pressed }) => [
+            styles.actionRow,
+            { borderBottomWidth: 0, gap: 4 },
+            pressed ? { opacity: 0.72 } : null,
+          ]}
         >
-          <Text style={styles.dangerText}>Clear all logged meals</Text>
+          <Text style={styles.dangerText}>
+            {clearTapCount > 0
+              ? `Clear all logged meals (${clearTapCount}/5)`
+              : 'Clear all logged meals'}
+          </Text>
+          <Text
+            style={[
+              styles.clearHintText,
+              clearTapCount > 0 ? styles.clearHintTextActive : null,
+            ]}
+          >
+            {clearTapCount === 0
+              ? 'Click 5 times to clear all logged meals'
+              : `Click ${5 - clearTapCount} more ${
+                  5 - clearTapCount === 1 ? 'time' : 'times'
+                } to confirm`}
+          </Text>
         </Pressable>
       </View>
 
       <Text style={styles.footerText}>
         {`Plate · ${versionMeta.fullBadge} · ${versionMeta.sdkLabel}`}
       </Text>
+
+      <Modal
+        visible={clearedPopupOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setClearedPopupOpen(false)}
+      >
+        <View style={styles.popupBackdrop}>
+          <View style={[styles.popupCard, cardShadow]}>
+            <View style={styles.popupBadge}>
+              <PlateIcon name="check" size={22} color="#FFFFFF" />
+            </View>
+            <Text style={styles.popupTitle}>All Meals Cleared</Text>
+            <Text style={styles.popupBody}>
+              All logged meals, water, and daily steps have been cleared. Your
+              profile, goals, and AI settings remain saved.
+            </Text>
+            <Pressable
+              onPress={() => setClearedPopupOpen(false)}
+              style={({ pressed }) => [
+                styles.popupBtn,
+                pressed ? { transform: [{ scale: 0.98 }] } : null,
+              ]}
+            >
+              <Text style={styles.popupBtnText}>OK</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
@@ -1250,6 +1302,68 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
     color: plateColors.danger,
+  },
+  clearHintText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: plateColors.muted,
+  },
+  clearHintTextActive: {
+    color: plateColors.danger,
+    fontWeight: '600',
+  },
+  popupBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.46)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  popupCard: {
+    width: '100%',
+    maxWidth: 320,
+    backgroundColor: plateColors.card,
+    borderRadius: 28,
+    paddingVertical: 24,
+    paddingHorizontal: 22,
+    alignItems: 'center',
+    gap: 10,
+  },
+  popupBadge: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: plateColors.ok,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 2,
+  },
+  popupTitle: {
+    fontSize: 19,
+    fontWeight: '700',
+    color: plateColors.ink,
+    letterSpacing: -0.4,
+    textAlign: 'center',
+  },
+  popupBody: {
+    fontSize: 13.5,
+    lineHeight: 19,
+    color: plateColors.muted,
+    textAlign: 'center',
+    marginBottom: 6,
+  },
+  popupBtn: {
+    width: '100%',
+    height: 48,
+    borderRadius: 99,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  popupBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15.5,
+    fontWeight: '600',
   },
   footerText: {
     textAlign: 'center',

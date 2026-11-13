@@ -5,6 +5,13 @@ All notable changes to **CalorieLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-11-13 (Build 5)
+
+### Changed
+- **Complete Initial Setup (`onboarding.tsx`)**: Expanded Initial Setup to collect everything required by Plate upfront — **Your name** (required), **Height (`cm`)** (for BMI), **Starting weight (`kg`)**, **Goal weight (`kg`)**, **Daily calories & editable Protein/Carbs/Fats (`g`)**, **Daily steps & water goals**, **Budget & reminder preferences**, and **AI provider authorization**.
+- **Removed Synthetic Historical Weight Data**: Removed the generated 180-day weight curve (`buildWeightSeries` / `mulberry32`) and legacy `84.6 -> 78.4 kg` demo profile gap; `Log weight` now records real dated weigh-ins (`weightHistory`), and the Progress chart plots only your real logged weights.
+- **5-Click Clear Meals Protection & Settings Streamlining**: `Clear all logged meals` now requires 5 clicks with a live countdown hint (`Click 5 times to clear all logged meals`) and displays a confirmation modal popup when cleared; removed `Restore backup from clipboard`.
+
 ## [1.1.2] - 2026-11-13 (Build 4)
 
 ### Changed

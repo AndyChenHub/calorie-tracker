@@ -21,6 +21,7 @@ import {
   createFoodMealEntry,
   formatNum,
   resolveMealImageSource,
+  upsertWeightLogPoint,
 } from '../constants/plateCatalog';
 import { PlateTabId, useCalorieTracker } from '../context/CalorieContext';
 import {
@@ -30,7 +31,11 @@ import {
 } from '../services/photos';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { MealEntry, MealItem } from '../types/models';
-import { formatTimeShort, inferMealTypeByHour } from '../utils/date';
+import {
+  formatTimeShort,
+  inferMealTypeByHour,
+  toLocalDateKey,
+} from '../utils/date';
 import { useIsDesktopStage } from './PhoneStageFrame';
 import { PlateIcon, PlateIconName } from './PlatePrimitives';
 
@@ -330,7 +335,15 @@ function WeightSheetBody({ onClose }: { onClose: () => void }) {
 
       <Pressable
         onPress={async () => {
-          await updateProfile({ weightKg: weightVal });
+          const todayKey = toLocalDateKey();
+          await updateProfile({
+            weightKg: weightVal,
+            weightHistory: upsertWeightLogPoint(
+              profile.weightHistory,
+              todayKey,
+              weightVal
+            ),
+          });
           onClose();
           showToast(`Weight logged · ${weightVal.toFixed(1)} kg`);
         }}
@@ -414,6 +427,7 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
   const { profile, updateProfile, showToast } = useCalorieTracker();
   const [name, setName] = useState(profile.name);
   const [heightStr, setHeightStr] = useState(String(profile.heightCm));
+  const [startWStr, setStartWStr] = useState(String(profile.startWeightKg));
   const [goalWStr, setGoalWStr] = useState(String(profile.goalWeightKg));
 
   return (
@@ -421,24 +435,35 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
       <Text style={styles.sheetTitle}>Edit profile</Text>
       <Text style={styles.sheetSub}>Used for BMI and weight goal charts</Text>
 
-      <View>
-        <Text style={styles.fieldLabel}>Name</Text>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          style={styles.sheetInput}
-          placeholder="Your name"
-          placeholderTextColor={plateColors.faint}
-        />
-      </View>
-
       <View style={{ flexDirection: 'row', gap: 10 }}>
+        <View style={{ flex: 1.4 }}>
+          <Text style={styles.fieldLabel}>Name</Text>
+          <TextInput
+            value={name}
+            onChangeText={setName}
+            style={styles.sheetInput}
+            placeholder="Your name"
+            placeholderTextColor={plateColors.faint}
+          />
+        </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.fieldLabel}>Height (cm)</Text>
           <TextInput
             value={heightStr}
             onChangeText={setHeightStr}
             keyboardType="numeric"
+            style={styles.sheetInput}
+          />
+        </View>
+      </View>
+
+      <View style={{ flexDirection: 'row', gap: 10 }}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.fieldLabel}>Starting weight (kg)</Text>
+          <TextInput
+            value={startWStr}
+            onChangeText={setStartWStr}
+            keyboardType="decimal-pad"
             style={styles.sheetInput}
           />
         </View>
@@ -455,13 +480,25 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
 
       <Pressable
         onPress={async () => {
+          const parsedStart = Math.max(
+            30,
+            Math.min(
+              300,
+              Math.round((Number(startWStr) || profile.startWeightKg) * 10) / 10
+            )
+          );
+          const parsedGoal = Math.max(
+            30,
+            Math.min(
+              300,
+              Math.round((Number(goalWStr) || profile.goalWeightKg) * 10) / 10
+            )
+          );
           await updateProfile({
-            name: name.trim() || 'Alex Morgan',
-            heightCm: Math.max(120, Math.min(240, Number(heightStr) || 180)),
-            goalWeightKg: Math.max(
-              35,
-              Math.min(220, Number(goalWStr) || profile.goalWeightKg)
-            ),
+            name: name.trim() || 'You',
+            heightCm: Math.max(120, Math.min(240, Number(heightStr) || 175)),
+            startWeightKg: parsedStart,
+            goalWeightKg: parsedGoal,
           });
           onClose();
           showToast('Profile saved');

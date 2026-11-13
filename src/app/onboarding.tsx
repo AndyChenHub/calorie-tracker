@@ -35,6 +35,7 @@ import {
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { AIProviderId } from '../types/models';
+import { toLocalDateKey } from '../utils/date';
 
 const CALORIE_PRESETS = [1800, 2000, 2250, 2500, 2800];
 
@@ -51,10 +52,15 @@ const MACRO_SPLITS: Record<
 
 export default function OnboardingScreen() {
   const isDesktopStage = useIsDesktopStage();
+  const scrollRef = useRef<React.ComponentRef<typeof ScrollView> | null>(null);
   const {
     hasCompletedOnboarding,
     goals,
     updateGoals,
+    profile,
+    updateProfile,
+    preferences,
+    updatePreferences,
     auth,
     updateAuth,
     companionStatus,
@@ -63,11 +69,66 @@ export default function OnboardingScreen() {
     completeOnboarding,
   } = useCalorieTracker();
 
+  const initialName =
+    profile.name &&
+    profile.name !== 'You' &&
+    profile.name !== 'Alex Morgan'
+      ? profile.name
+      : '';
+
+  const [nameInput, setNameInput] = useState(initialName);
+  const [heightInput, setHeightInput] = useState(
+    String(profile.heightCm || 175)
+  );
+  const [startWeightInput, setStartWeightInput] = useState(
+    String(profile.startWeightKg || profile.weightKg || 75)
+  );
+  const [goalWeightInput, setGoalWeightInput] = useState(
+    String(profile.goalWeightKg || 70)
+  );
+  const [startWeightEdited, setStartWeightEdited] = useState(false);
+
   const [calorieInput, setCalorieInput] = useState(
     String(goals.dailyCalories || 2250)
   );
   const [macroSplit, setMacroSplit] = useState<MacroSplitId>('balanced');
-  const [goalsEdited, setGoalsEdited] = useState(false);
+  const [customMacrosEdited, setCustomMacrosEdited] = useState(
+    hasCompletedOnboarding
+  );
+  const [proteinInput, setProteinInput] = useState(
+    String(
+      hasCompletedOnboarding
+        ? goals.proteinGrams
+        : Math.round(((goals.dailyCalories || 2250) * 0.3) / 4)
+    )
+  );
+  const [carbsInput, setCarbsInput] = useState(
+    String(
+      hasCompletedOnboarding
+        ? goals.carbsGrams
+        : Math.round(((goals.dailyCalories || 2250) * 0.4) / 4)
+    )
+  );
+  const [fatInput, setFatInput] = useState(
+    String(
+      hasCompletedOnboarding
+        ? goals.fatGrams
+        : Math.round(((goals.dailyCalories || 2250) * 0.3) / 9)
+    )
+  );
+
+  const [stepsInput, setStepsInput] = useState(
+    String(goals.dailySteps || 10000)
+  );
+  const [waterInput, setWaterInput] = useState(
+    String(goals.waterGlasses || 8)
+  );
+
+  const [addBurnedPref, setAddBurnedPref] = useState(preferences.addBurned);
+  const [rolloverPref, setRolloverPref] = useState(preferences.rollover);
+  const [remindersPref, setRemindersPref] = useState(preferences.reminders);
+
+  const [setupError, setSetupError] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<AIProviderId>(
     auth.activeProvider
   );
@@ -101,23 +162,115 @@ export default function OnboardingScreen() {
     };
   }, []);
 
-  const parsedCalories = Math.max(800, parseInt(calorieInput, 10) || 2250);
-  const split = MACRO_SPLITS[macroSplit];
-  const preserveSavedMacros = hasCompletedOnboarding && !goalsEdited;
-  const computedProtein = preserveSavedMacros
-    ? goals.proteinGrams
-    : Math.round((parsedCalories * split.p) / 4);
-  const computedCarbs = preserveSavedMacros
-    ? goals.carbsGrams
-    : Math.round((parsedCalories * split.c) / 4);
-  const computedFat = preserveSavedMacros
-    ? goals.fatGrams
-    : Math.round((parsedCalories * split.f) / 9);
+  const parsedCalories = Math.max(
+    800,
+    Math.min(10000, parseInt(calorieInput, 10) || 2250)
+  );
+  const parsedProtein = Math.max(
+    10,
+    Math.min(600, parseInt(proteinInput, 10) || 160)
+  );
+  const parsedCarbs = Math.max(
+    10,
+    Math.min(900, parseInt(carbsInput, 10) || 220)
+  );
+  const parsedFat = Math.max(10, Math.min(400, parseInt(fatInput, 10) || 70));
+
+  const parsedHeightCm = Math.max(
+    120,
+    Math.min(240, Math.round(parseFloat(heightInput.replace(',', '.')) || 175))
+  );
+  const parsedStepsGoal = Math.max(
+    1000,
+    Math.min(50000, parseInt(stepsInput, 10) || 10000)
+  );
+  const parsedWaterGlasses = Math.max(
+    1,
+    Math.min(20, parseInt(waterInput, 10) || 8)
+  );
+
+  const syncMacrosFromCaloriesAndSplit = (
+    kcal: number,
+    splitId: MacroSplitId
+  ) => {
+    const sp = MACRO_SPLITS[splitId];
+    setCustomMacrosEdited(false);
+    setProteinInput(String(Math.round((kcal * sp.p) / 4)));
+    setCarbsInput(String(Math.round((kcal * sp.c) / 4)));
+    setFatInput(String(Math.round((kcal * sp.f) / 9)));
+  };
+
+  const handleCalorieChange = (raw: string) => {
+    setCalorieInput(raw);
+    const num = Math.max(800, Math.min(10000, parseInt(raw, 10) || 2250));
+    syncMacrosFromCaloriesAndSplit(num, macroSplit);
+  };
 
   const stepCalories = (delta: number) => {
     const next = Math.max(1000, Math.min(6000, parsedCalories + delta));
-    setGoalsEdited(true);
     setCalorieInput(String(next));
+    syncMacrosFromCaloriesAndSplit(next, macroSplit);
+  };
+
+  const stepHeight = (delta: number) => {
+    const next = Math.max(120, Math.min(240, parsedHeightCm + delta));
+    setHeightInput(String(next));
+  };
+
+  const stepStepsGoal = (delta: number) => {
+    const next = Math.max(1000, Math.min(50000, parsedStepsGoal + delta));
+    setStepsInput(String(next));
+  };
+
+  const stepWaterGoal = (delta: number) => {
+    const next = Math.max(1, Math.min(20, parsedWaterGlasses + delta));
+    setWaterInput(String(next));
+  };
+
+  const parsedStartWeight = Math.max(
+    30,
+    Math.min(
+      300,
+      Math.round(
+        (parseFloat(startWeightInput.replace(',', '.')) ||
+          profile.startWeightKg ||
+          75) * 10
+      ) / 10
+    )
+  );
+  const parsedGoalWeight = Math.max(
+    30,
+    Math.min(
+      300,
+      Math.round(
+        (parseFloat(goalWeightInput.replace(',', '.')) ||
+          profile.goalWeightKg ||
+          70) * 10
+      ) / 10
+    )
+  );
+  const weightGoalDelta = Number(
+    (parsedGoalWeight - parsedStartWeight).toFixed(1)
+  );
+  const previewBmi = Number(
+    (parsedStartWeight / Math.pow(parsedHeightCm / 100, 2)).toFixed(1)
+  );
+
+  const stepStartWeight = (delta: number) => {
+    const next = Math.max(
+      30,
+      Math.min(300, Math.round((parsedStartWeight + delta) * 10) / 10)
+    );
+    setStartWeightEdited(true);
+    setStartWeightInput(String(next));
+  };
+
+  const stepGoalWeight = (delta: number) => {
+    const next = Math.max(
+      30,
+      Math.min(300, Math.round((parsedGoalWeight + delta) * 10) / 10)
+    );
+    setGoalWeightInput(String(next));
   };
 
   const handleChatGPTSignIn = async () => {
@@ -345,28 +498,57 @@ export default function OnboardingScreen() {
     }
   };
 
-  const handleSkipSetup = async () => {
-    setSaving(true);
-    try {
-      await completeOnboarding();
+  const handleCloseSetup = () => {
+    if (router.canGoBack()) {
+      router.back();
+    } else {
       router.replace('/');
-    } finally {
-      setSaving(false);
     }
   };
 
   const handleFinishSetup = async () => {
+    const trimmedName = nameInput.trim();
+    if (!trimmedName) {
+      setSetupError('Please enter your name to finish setting up Plate.');
+      scrollRef.current?.scrollTo({ y: 0, animated: true });
+      return;
+    }
+
+    setSetupError(null);
     setSaving(true);
     try {
-      if (!hasCompletedOnboarding || goalsEdited) {
-        await updateGoals({
-          ...goals,
-          dailyCalories: parsedCalories,
-          proteinGrams: computedProtein,
-          carbsGrams: computedCarbs,
-          fatGrams: computedFat,
-        });
-      }
+      const todayKey = toLocalDateKey();
+      const resetCurrentToStart =
+        !hasCompletedOnboarding ||
+        startWeightEdited ||
+        (profile.weightHistory ?? []).length === 0;
+
+      await updateProfile({
+        name: trimmedName,
+        heightCm: parsedHeightCm,
+        startWeightKg: parsedStartWeight,
+        goalWeightKg: parsedGoalWeight,
+        weightKg: resetCurrentToStart ? parsedStartWeight : profile.weightKg,
+        weightHistory: resetCurrentToStart
+          ? [{ dateKey: todayKey, weightKg: parsedStartWeight }]
+          : profile.weightHistory ?? [],
+      });
+
+      await updateGoals({
+        dailyCalories: parsedCalories,
+        proteinGrams: parsedProtein,
+        carbsGrams: parsedCarbs,
+        fatGrams: parsedFat,
+        dailySteps: parsedStepsGoal,
+        waterGlasses: parsedWaterGlasses,
+      });
+
+      await updatePreferences({
+        addBurned: addBurnedPref,
+        rollover: rolloverPref,
+        reminders: remindersPref,
+      });
+
       await updateAuth({
         activeProvider: selectedProvider,
         claudeApiKey: claudeKey.trim(),
@@ -416,6 +598,7 @@ export default function OnboardingScreen() {
         ]}
       >
         <ScrollView
+          ref={scrollRef}
           contentContainerStyle={styles.scrollBody}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
@@ -427,38 +610,179 @@ export default function OnboardingScreen() {
               <View>
                 <Text style={styles.brandTitle}>Plate</Text>
                 <Text style={styles.brandSub}>
-                  {`Setup · ${versionMeta.shortBadge}`}
+                  {`Initial Setup · ${versionMeta.shortBadge}`}
                 </Text>
               </View>
             </View>
 
-            <Pressable
-              onPress={handleSkipSetup}
-              style={styles.skipPill}
-            >
-              <Text style={styles.skipPillText}>Skip</Text>
-            </Pressable>
+            {hasCompletedOnboarding ? (
+              <Pressable onPress={handleCloseSetup} style={styles.skipPill}>
+                <Text style={styles.skipPillText}>Close</Text>
+              </Pressable>
+            ) : null}
           </View>
 
           <Text style={styles.headline}>
-            Set your daily goal & connect AI vision.
+            Set up your profile, daily targets & AI camera scanner.
           </Text>
 
-          {/* Card 1: Daily Calorie Target */}
+          {setupError ? (
+            <View style={styles.errorBanner}>
+              <Text style={styles.errorBannerText}>{setupError}</Text>
+            </View>
+          ) : null}
+
+          {/* Card 1: Your Profile (Name, Height, Starting Weight, Goal Weight) */}
           <View style={[styles.card, cardShadow]}>
             <View style={styles.cardTopRow}>
-              <Text style={styles.cardTitle}>Daily calorie goal</Text>
+              <Text style={styles.cardTitle}>Your profile</Text>
+              <Text style={styles.weightSummaryPill}>
+                {`BMI ${previewBmi} · ${
+                  Math.abs(weightGoalDelta) < 0.05
+                    ? 'Maintain'
+                    : weightGoalDelta < 0
+                      ? `Target −${Math.abs(weightGoalDelta).toFixed(1)} kg`
+                      : `Target +${weightGoalDelta.toFixed(1)} kg`
+                }`}
+              </Text>
+            </View>
+
+            {/* Name + Height Row */}
+            <View style={styles.weightSetupRow}>
+              <View style={[styles.weightSetupCol, { flex: 1.25 }]}>
+                <Text style={styles.weightFieldLabel}>Your name</Text>
+                <TextInput
+                  value={nameInput}
+                  onChangeText={(v) => {
+                    if (setupError) setSetupError(null);
+                    setNameInput(v);
+                  }}
+                  placeholder="Enter your name"
+                  placeholderTextColor={plateColors.faint}
+                  autoCapitalize="words"
+                  returnKeyType="done"
+                  style={[
+                    styles.profileNameInput,
+                    setupError && !nameInput.trim()
+                      ? styles.profileNameInputError
+                      : null,
+                  ]}
+                />
+              </View>
+
+              <View style={[styles.weightSetupCol, { flex: 1 }]}>
+                <Text style={styles.weightFieldLabel}>Height</Text>
+                <View style={styles.weightInputBox}>
+                  <Pressable
+                    onPress={() => stepHeight(-1)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="minus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                  <View style={styles.weightNumberWrap}>
+                    <TextInput
+                      value={heightInput}
+                      onChangeText={setHeightInput}
+                      keyboardType="numeric"
+                      maxLength={3}
+                      style={styles.weightInputText}
+                    />
+                    <Text style={styles.weightInputUnit}>cm</Text>
+                  </View>
+                  <Pressable
+                    onPress={() => stepHeight(1)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="plus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+
+            {/* Starting Weight + Goal Weight Row */}
+            <View style={styles.weightSetupRow}>
+              <View style={styles.weightSetupCol}>
+                <Text style={styles.weightFieldLabel}>Starting weight</Text>
+                <View style={styles.weightInputBox}>
+                  <Pressable
+                    onPress={() => stepStartWeight(-0.5)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="minus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                  <View style={styles.weightNumberWrap}>
+                    <TextInput
+                      value={startWeightInput}
+                      onChangeText={(v) => {
+                        setStartWeightEdited(true);
+                        setStartWeightInput(v);
+                      }}
+                      keyboardType="decimal-pad"
+                      maxLength={5}
+                      style={styles.weightInputText}
+                    />
+                    <Text style={styles.weightInputUnit}>kg</Text>
+                  </View>
+                  <Pressable
+                    onPress={() => stepStartWeight(0.5)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="plus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                </View>
+              </View>
+
+              <View style={styles.weightSetupCol}>
+                <Text style={styles.weightFieldLabel}>Goal weight</Text>
+                <View style={styles.weightInputBox}>
+                  <Pressable
+                    onPress={() => stepGoalWeight(-0.5)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="minus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                  <View style={styles.weightNumberWrap}>
+                    <TextInput
+                      value={goalWeightInput}
+                      onChangeText={setGoalWeightInput}
+                      keyboardType="decimal-pad"
+                      maxLength={5}
+                      style={styles.weightInputText}
+                    />
+                    <Text style={styles.weightInputUnit}>kg</Text>
+                  </View>
+                  <Pressable
+                    onPress={() => stepGoalWeight(0.5)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="plus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+          </View>
+
+          {/* Card 2: Daily Calorie & Macro Targets */}
+          <View style={[styles.card, cardShadow]}>
+            <View style={styles.cardTopRow}>
+              <Text style={styles.cardTitle}>Daily calories & macros</Text>
               <Text style={styles.macroSummary}>
                 <Text style={{ color: plateColors.protein }}>
-                  {`${computedProtein}P`}
+                  {`${parsedProtein}P`}
                 </Text>
                 {' · '}
                 <Text style={{ color: plateColors.carbs }}>
-                  {`${computedCarbs}C`}
+                  {`${parsedCarbs}C`}
                 </Text>
                 {' · '}
                 <Text style={{ color: plateColors.fat }}>
-                  {`${computedFat}F`}
+                  {`${parsedFat}F`}
                 </Text>
               </Text>
             </View>
@@ -474,10 +798,7 @@ export default function OnboardingScreen() {
               <View style={styles.calorieInputCenter}>
                 <TextInput
                   value={calorieInput}
-                  onChangeText={(v) => {
-                    setGoalsEdited(true);
-                    setCalorieInput(v);
-                  }}
+                  onChangeText={handleCalorieChange}
                   keyboardType="numeric"
                   maxLength={5}
                   style={styles.calorieBigInput}
@@ -500,8 +821,8 @@ export default function OnboardingScreen() {
                   <Pressable
                     key={val}
                     onPress={() => {
-                      setGoalsEdited(true);
                       setCalorieInput(String(val));
+                      syncMacrosFromCaloriesAndSplit(val, macroSplit);
                     }}
                     style={[
                       styles.presetChip,
@@ -523,13 +844,13 @@ export default function OnboardingScreen() {
 
             <View style={styles.segmentedBar}>
               {(Object.keys(MACRO_SPLITS) as MacroSplitId[]).map((id) => {
-                const active = !preserveSavedMacros && macroSplit === id;
+                const active = !customMacrosEdited && macroSplit === id;
                 return (
                   <Pressable
                     key={id}
                     onPress={() => {
-                      setGoalsEdited(true);
                       setMacroSplit(id);
+                      syncMacrosFromCaloriesAndSplit(parsedCalories, id);
                     }}
                     style={[
                       styles.segItem,
@@ -548,9 +869,174 @@ export default function OnboardingScreen() {
                 );
               })}
             </View>
+
+            {/* Editable Protein / Carbs / Fats Grams */}
+            <View style={styles.macroInputsRow}>
+              <View style={styles.macroInputCol}>
+                <Text
+                  style={[styles.weightFieldLabel, { color: plateColors.protein }]}
+                >
+                  Protein (g)
+                </Text>
+                <TextInput
+                  value={proteinInput}
+                  onChangeText={(v) => {
+                    setCustomMacrosEdited(true);
+                    setProteinInput(v);
+                  }}
+                  keyboardType="numeric"
+                  maxLength={4}
+                  style={styles.macroSmallInput}
+                />
+              </View>
+              <View style={styles.macroInputCol}>
+                <Text
+                  style={[styles.weightFieldLabel, { color: plateColors.carbs }]}
+                >
+                  Carbs (g)
+                </Text>
+                <TextInput
+                  value={carbsInput}
+                  onChangeText={(v) => {
+                    setCustomMacrosEdited(true);
+                    setCarbsInput(v);
+                  }}
+                  keyboardType="numeric"
+                  maxLength={4}
+                  style={styles.macroSmallInput}
+                />
+              </View>
+              <View style={styles.macroInputCol}>
+                <Text
+                  style={[styles.weightFieldLabel, { color: plateColors.fat }]}
+                >
+                  Fats (g)
+                </Text>
+                <TextInput
+                  value={fatInput}
+                  onChangeText={(v) => {
+                    setCustomMacrosEdited(true);
+                    setFatInput(v);
+                  }}
+                  keyboardType="numeric"
+                  maxLength={4}
+                  style={styles.macroSmallInput}
+                />
+              </View>
+            </View>
           </View>
 
-          {/* Card 2: Official AI Provider SSO */}
+          {/* Card 3: Activity, Hydration & Preferences */}
+          <View style={[styles.card, cardShadow]}>
+            <Text style={styles.cardTitle}>Activity, water & budget</Text>
+
+            <View style={styles.weightSetupRow}>
+              <View style={styles.weightSetupCol}>
+                <Text style={styles.weightFieldLabel}>Daily steps goal</Text>
+                <View style={styles.weightInputBox}>
+                  <Pressable
+                    onPress={() => stepStepsGoal(-500)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="minus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                  <View style={styles.weightNumberWrap}>
+                    <TextInput
+                      value={stepsInput}
+                      onChangeText={setStepsInput}
+                      keyboardType="numeric"
+                      maxLength={6}
+                      style={[styles.weightInputText, { fontSize: 16 }]}
+                    />
+                  </View>
+                  <Pressable
+                    onPress={() => stepStepsGoal(500)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="plus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                </View>
+              </View>
+
+              <View style={styles.weightSetupCol}>
+                <Text style={styles.weightFieldLabel}>Daily water goal</Text>
+                <View style={styles.weightInputBox}>
+                  <Pressable
+                    onPress={() => stepWaterGoal(-1)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="minus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                  <View style={styles.weightNumberWrap}>
+                    <TextInput
+                      value={waterInput}
+                      onChangeText={setWaterInput}
+                      keyboardType="numeric"
+                      maxLength={2}
+                      style={styles.weightInputText}
+                    />
+                    <Text style={styles.weightInputUnit}>gl</Text>
+                  </View>
+                  <Pressable
+                    onPress={() => stepWaterGoal(1)}
+                    hitSlop={6}
+                    style={styles.weightMiniStepBtn}
+                  >
+                    <PlateIcon name="plus" size={14} color={plateColors.ink} />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+
+            <View style={styles.prefToggleList}>
+              {[
+                {
+                  label: 'Add burned calories to daily budget',
+                  val: addBurnedPref,
+                  toggle: () => setAddBurnedPref((v) => !v),
+                },
+                {
+                  label: 'Roll over unused calories',
+                  val: rolloverPref,
+                  toggle: () => setRolloverPref((v) => !v),
+                },
+                {
+                  label: 'Meal logging reminders',
+                  val: remindersPref,
+                  toggle: () => setRemindersPref((v) => !v),
+                },
+              ].map((item, idx) => (
+                <Pressable
+                  key={item.label}
+                  onPress={item.toggle}
+                  style={[
+                    styles.prefToggleRow,
+                    idx === 2 ? { borderBottomWidth: 0, paddingBottom: 0 } : null,
+                  ]}
+                >
+                  <Text style={styles.prefToggleLabel}>{item.label}</Text>
+                  <View
+                    style={[
+                      styles.miniSwitchTrack,
+                      item.val ? styles.miniSwitchTrackOn : null,
+                    ]}
+                  >
+                    <View
+                      style={[
+                        styles.miniSwitchThumb,
+                        item.val ? styles.miniSwitchThumbOn : null,
+                      ]}
+                    />
+                  </View>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
+          {/* Card 4: Official AI Provider SSO */}
           <View style={[styles.card, cardShadow]}>
             <View style={styles.cardTopRow}>
               <Text style={styles.cardTitle}>Authorize AI provider</Text>
@@ -968,6 +1454,91 @@ const styles = StyleSheet.create({
     color: plateColors.ink2,
     marginBottom: 2,
   },
+  errorBanner: {
+    backgroundColor: '#FFE9E7',
+    borderRadius: 14,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(229,72,77,0.28)',
+  },
+  errorBannerText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: plateColors.danger,
+  },
+  profileNameInput: {
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: plateColors.chip,
+    paddingHorizontal: 13,
+    fontSize: 15.5,
+    fontWeight: '600',
+    color: plateColors.ink,
+  },
+  profileNameInputError: {
+    borderWidth: 1.5,
+    borderColor: plateColors.danger,
+    backgroundColor: '#FFF5F5',
+  },
+  macroInputsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  macroInputCol: {
+    flex: 1,
+    gap: 5,
+  },
+  macroSmallInput: {
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: plateColors.chip,
+    textAlign: 'center',
+    fontSize: 15,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
+  },
+  prefToggleList: {
+    borderTopWidth: 1,
+    borderTopColor: plateColors.line,
+    paddingTop: 4,
+  },
+  prefToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: plateColors.line,
+  },
+  prefToggleLabel: {
+    flex: 1,
+    fontSize: 13.5,
+    fontWeight: '500',
+    color: plateColors.ink,
+    paddingRight: 10,
+  },
+  miniSwitchTrack: {
+    width: 44,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: '#E2E2E6',
+    padding: 2.5,
+    justifyContent: 'center',
+  },
+  miniSwitchTrackOn: {
+    backgroundColor: plateColors.ink,
+  },
+  miniSwitchThumb: {
+    width: 21,
+    height: 21,
+    borderRadius: 10.5,
+    backgroundColor: '#FFFFFF',
+  },
+  miniSwitchThumbOn: {
+    transform: [{ translateX: 18 }],
+  },
   card: {
     backgroundColor: plateColors.card,
     borderRadius: 26,
@@ -1079,6 +1650,63 @@ const styles = StyleSheet.create({
   },
   segTextActive: {
     color: plateColors.ink,
+  },
+  weightSummaryPill: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.ok,
+    fontVariant: ['tabular-nums'],
+  },
+  weightSetupRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  weightSetupCol: {
+    flex: 1,
+    gap: 6,
+  },
+  weightFieldLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.muted,
+  },
+  weightInputBox: {
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: plateColors.chip,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 6,
+  },
+  weightMiniStepBtn: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  weightNumberWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'center',
+    gap: 2,
+  },
+  weightInputText: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: plateColors.ink,
+    textAlign: 'center',
+    fontVariant: ['tabular-nums'],
+    paddingVertical: 0,
+    minWidth: 42,
+  },
+  weightInputUnit: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.muted,
   },
   authBadge: {
     flexDirection: 'row',

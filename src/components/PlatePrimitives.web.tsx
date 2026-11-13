@@ -204,12 +204,9 @@ export function ProgressRing({
   );
 }
 
-export function WeightAreaChart({
-  series,
-  range,
-  goalWeight,
-}: WeightAreaChartProps) {
-  const g = computeWeightChartGeometry(series, range, goalWeight);
+export function WeightAreaChart(props: WeightAreaChartProps) {
+  const { goalWeight } = props;
+  const g = computeWeightChartGeometry(props);
 
   return (
     <View style={styles.chartWrap}>
@@ -283,14 +280,18 @@ export function WeightAreaChart({
           {`Goal ${goalWeight}`}
         </text>
 
-        <path d={g.areaPath} fill="url(#wgWeb)" />
-        <path
-          d={g.linePath}
-          fill="none"
-          stroke="#0B0B0C"
-          strokeWidth={2.5}
-          strokeLinecap="round"
-        />
+        {g.hasTrendLine ? (
+          <>
+            <path d={g.areaPath} fill="url(#wgWeb)" />
+            <path
+              d={g.linePath}
+              fill="none"
+              stroke="#0B0B0C"
+              strokeWidth={2.5}
+              strokeLinecap="round"
+            />
+          </>
+        ) : null}
         <circle
           cx={g.last[0]}
           cy={g.last[1]}
