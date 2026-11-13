@@ -79,7 +79,7 @@ jobs:
           path: |
             ios/Pods
             ~/Library/Caches/CocoaPods
-          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile', 'package-lock.json', 'app.json') }}
+          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile', 'package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-pods-
 
@@ -151,6 +151,8 @@ jobs:
 
           ls -lh "$IPA_NAME"
           echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUM}" >> "$GITHUB_OUTPUT"
 
       - name: Upload .ipa artifact
         uses: actions/upload-artifact@v7
@@ -160,12 +162,43 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach .ipa to GitHub Release (on v* tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ steps.package_ipa.outputs.ipa_name }}
-          generate_release_notes: true
+      - name: Publish .ipa to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IPA_FILE="${{ steps.package_ipa.outputs.ipa_name }}"
+          VERSION="${{ steps.package_ipa.outputs.app_version }}"
+          BUILD_NUM="${{ steps.package_ipa.outputs.build_number }}"
+
+          cp "$IPA_FILE" Plate.ipa
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            TAG_NAME="v${VERSION}-build.${BUILD_NUM}"
+          fi
+
+          TITLE="Plate v${VERSION} (Build ${BUILD_NUM})"
+
+          if gh release view "$TAG_NAME" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "$IPA_FILE" Plate.ipa \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create "$TAG_NAME" "$IPA_FILE" Plate.ipa \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "$TITLE" \
+              --generate-notes \
+              --latest
+          fi
+
+          {
+            echo "### Published iOS Release: ${TITLE}"
+            echo "- **Release Page:** https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG_NAME}"
+            echo "- **Always-Latest Direct IPA Link:** https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/Plate.ipa"
+            echo "- **Versioned IPA Asset:** \`${IPA_FILE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build-signed-eas-ipa:
     name: Trigger Signed EAS Cloud Build
