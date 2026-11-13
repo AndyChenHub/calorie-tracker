@@ -1,0 +1,171 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed_eas_build:
+        description: 'Also trigger a signed EAS Cloud Build (requires EXPO_TOKEN secret)'
+        required: false
+        default: false
+        type: boolean
+      eas_profile:
+        description: 'EAS build profile (preview = Ad Hoc IPA, production = App Store IPA)'
+        required: false
+        default: 'preview'
+        type: choice
+        options:
+          - preview
+          - production
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-unsigned-ipa:
+    name: Build Standalone iOS IPA (macOS Xcode)
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Selecting Xcode at: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck & lint
+        run: |
+          npm run typecheck
+          npm run lint
+
+      - name: Generate native iOS project (Expo Prebuild)
+        env:
+          CI: '1'
+        run: |
+          npx expo prebuild --platform ios --clean --no-install
+          echo "export NODE_BINARY=$(command -v node)" > ios/.xcode.env.local
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: ${{ runner.os }}-pods-${{ hashFiles('ios/Podfile', 'package-lock.json', 'app.json') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-
+
+      - name: Install CocoaPods
+        working-directory: ios
+        env:
+          LANG: en_US.UTF-8
+        run: pod install || pod install --repo-update
+
+      - name: Compile Release iOS .app (arm64 iphoneos)
+        env:
+          CI: '1'
+          NODE_ENV: production
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | jq -r '.workspace.schemes[] | select(. != "Pods" and (startswith("Pods-") | not))' | head -n 1)
+          echo "Building workspace=$WORKSPACE scheme=$SCHEME"
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+
+      - name: Package Payload into .ipa
+        id: package_ipa
+        run: |
+          APP_PATH=$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Compiled .app bundle was not found in ios/build/Build/Products/Release-iphoneos"
+            exit 1
+          fi
+
+          if [ ! -f "$APP_PATH/main.jsbundle" ]; then
+            echo "::error::main.jsbundle missing inside $APP_PATH — Release JS bundle was not embedded"
+            exit 1
+          fi
+
+          VERSION=$(node -p "require('./app.json').expo.version")
+          BUILD_NUM=$(node -p "require('./app.json').expo.ios.buildNumber")
+          IPA_NAME="Plate-v${VERSION}-build${BUILD_NUM}.ipa"
+
+          rm -rf build-ipa "$IPA_NAME"
+          mkdir -p build-ipa/Payload
+          cp -R "$APP_PATH" build-ipa/Payload/
+          (cd build-ipa && ditto -c -k --sequesterRsrc --keepParent Payload "../${IPA_NAME}")
+
+          ls -lh "$IPA_NAME"
+          echo "ipa_name=${IPA_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Plate-iOS-IPA
+          path: ${{ steps.package_ipa.outputs.ipa_name }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach .ipa to GitHub Release (on v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package_ipa.outputs.ipa_name }}
+          generate_release_notes: true
+
+  build-signed-eas-ipa:
+    name: Trigger Signed EAS Cloud Build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.signed_eas_build == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Trigger EAS iOS Build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "::error::Missing EXPO_TOKEN repository secret. Add an Expo Access Token under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          npx eas-cli@latest build --platform ios --profile "${{ inputs.eas_profile || 'preview' }}" --non-interactive --no-wait

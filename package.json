@@ -45,6 +45,12 @@
     "version:minor": "node ./scripts/bump-version.mjs minor",
     "version:major": "node ./scripts/bump-version.mjs major",
     "version:build": "node ./scripts/bump-version.mjs build",
+    "eas:login": "npx eas-cli@latest login",
+    "eas:init": "npx eas-cli@latest init",
+    "eas:device": "npx eas-cli@latest device:create",
+    "build:ipa": "npx eas-cli@latest build --platform ios --profile preview",
+    "build:ipa:prod": "npx eas-cli@latest build --platform ios --profile production",
+    "submit:ios": "npx eas-cli@latest submit --platform ios --profile production",
     "typecheck": "tsc --noEmit",
     "lint": "expo lint"
   },

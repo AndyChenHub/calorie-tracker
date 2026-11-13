@@ -1,0 +1,30 @@
+# Keep everything ignored in .gitignore out of EAS build uploads
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.ipa
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.DS_Store
+*.pem
+.env*.local
+*.tsbuildinfo
+/ios
+/android
+
+# Exclude non-mobile directories from EAS cloud archive uploads
+/backend
+/design-prototype
+/.github
+.git

@@ -48,6 +48,32 @@ npm run web    # Preview in browser at http://localhost:8081
 
 ---
 
+## Building an iOS `.ipa` (from Windows)
+
+Because Apple requires macOS + Xcode to compile iOS binaries, **Plate** includes two cloud `.ipa` pipelines so you can produce an installable `.ipa` directly from Windows:
+
+### Option 1 — Signed `.ipa` via Expo EAS Cloud Build (Recommended with Apple Developer Account)
+
+Produces an Apple-signed **Ad Hoc `.ipa`** (`preview` profile) with a direct QR-code install link for your iPhone, or an **App Store / TestFlight `.ipa`** (`production` profile):
+
+```powershell
+npm run eas:login       # Sign in to your Expo account (one-time)
+npm run eas:init        # Link repo to your Expo project (one-time)
+npm run eas:device      # Register your iPhone UDID for Ad Hoc install (one-time)
+npm run build:ipa       # Cloud-builds a signed Release Ad Hoc .ipa (preview profile)
+npm run build:ipa:prod  # Cloud-builds a signed App Store / TestFlight .ipa (production profile)
+```
+
+### Option 2 — Unsigned `.ipa` via GitHub Actions macOS Xcode Runner (Free / Sideloading)
+
+[.github/workflows/build-ios-ipa.yml](.github/workflows/build-ios-ipa.yml) compiles `Plate` on GitHub's `macos-latest` Xcode runner (`expo prebuild` -> `pod install` -> `xcodebuild Release iphoneos` with embedded `main.jsbundle`) and packages `Plate-v<version>-build<build>.ipa`:
+
+1. Push to `main` (or open **Actions -> Build iOS IPA -> Run workflow** on GitHub).
+2. Download the **`Plate-iOS-IPA`** artifact (`Plate-v1.1.0-build2.ipa`) from the completed workflow run (or from **GitHub Releases** when pushing a `v*` tag).
+3. Install onto your iPhone using **AltStore**, **SideStore**, **Sideloadly**, or **Feather** with a free Apple ID (no `$99/yr` Apple Developer subscription required).
+
+---
+
 ## Versioning & Releases
 
 Plate uses **Semantic Versioning** (`MAJOR.MINOR.PATCH`) synchronized across [package.json](package.json), [app.json](app.json) (`version`, `ios.buildNumber`, `android.versionCode`, `runtimeVersion` policy `appVersion`), [eas.json](eas.json), [src/constants/version.ts](src/constants/version.ts), [backend/server.py](backend/server.py), and [CHANGELOG.md](CHANGELOG.md):

@@ -15,9 +15,12 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.calorielens.tracker",
       "buildNumber": "2",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
       "infoPlist": {
-        "NSCameraUsageDescription": "CalorieLens uses your camera to take photos of your meals and analyze calories and macros.",
-        "NSPhotoLibraryUsageDescription": "CalorieLens accesses your photo library so you can upload meal photos for calorie and macro analysis."
+        "NSCameraUsageDescription": "Plate uses your camera to take photos of your meals and analyze calories and macros.",
+        "NSPhotoLibraryUsageDescription": "Plate accesses your photo library so you can upload meal photos for calorie and macro analysis."
       }
     },
     "android": {

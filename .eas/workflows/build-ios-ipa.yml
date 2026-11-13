@@ -1,0 +1,10 @@
+name: Build iOS IPA (EAS)
+
+jobs:
+  build_ios_ipa:
+    name: Build Ad Hoc iOS IPA
+    type: build
+    params:
+      platform: ios
+      profile: preview
+      refresh_ad_hoc_provisioning_profile: true
