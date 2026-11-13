@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Plate",
+    "slug": "calorie-tracker",
+    "scheme": "calorietracker",
+    "version": "1.1.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "backgroundColor": "#F5F5F7",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.calorielens.tracker",
+      "buildNumber": "2",
+      "infoPlist": {
+        "NSCameraUsageDescription": "CalorieLens uses your camera to take photos of your meals and analyze calories and macros.",
+        "NSPhotoLibraryUsageDescription": "CalorieLens accesses your photo library so you can upload meal photos for calorie and macro analysis."
+      }
+    },
+    "android": {
+      "package": "com.calorielens.tracker",
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-font"
+    ],
+    "extra": {
+      "releaseChannel": "stable",
+      "releaseDate": "2026-11-13"
+    }
+  }
+}
