@@ -1,11 +1,15 @@
 import { CameraType, CameraView, useCameraPermissions } from 'expo-camera';
+import * as Clipboard from 'expo-clipboard';
 import { LinearGradient } from 'expo-linear-gradient';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
   Image,
+  Keyboard,
+  KeyboardAvoidingView,
   Linking,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -14,6 +18,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   CATALOG_EXERCISES,
   CATALOG_FOODS,
@@ -26,6 +31,11 @@ import {
 } from '../constants/plateCatalog';
 import { PlateTabId, useCalorieTracker } from '../context/CalorieContext';
 import {
+  BarcodeProductResult,
+  lookupFoodBarcode,
+  sanitizeBarcodeDigits,
+} from '../services/barcode';
+import {
   capturePhotoFromCamera,
   PickedMealPhoto,
   pickPhotoFromLibrary,
@@ -37,8 +47,26 @@ import {
   inferMealTypeByHour,
   toLocalDateKey,
 } from '../utils/date';
+import { stripImageMetadataBase64 } from '../utils/imagePrivacy';
+import { useKeyboardState } from '../utils/useKeyboardState';
 import { useIsDesktopStage } from './PhoneStageFrame';
 import { PlateIcon, PlateIconName } from './PlatePrimitives';
+
+function parseMetricNumber(
+  raw: string,
+  fallback: number,
+  min: number,
+  max: number,
+  decimals = 1
+): number {
+  const cleaned = raw.trim().replace(',', '.');
+  if (!cleaned) return fallback;
+  const parsed = Number(cleaned);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  const clamped = Math.max(min, Math.min(max, parsed));
+  const factor = Math.pow(10, decimals);
+  return Math.round(clamped * factor) / factor;
+}
 
 export type ActiveSheetType =
   | 'saved'
@@ -296,18 +324,36 @@ function ExerciseSheetBody({ onClose }: { onClose: () => void }) {
 
 function WeightSheetBody({ onClose }: { onClose: () => void }) {
   const { profile, updateProfile, showToast } = useCalorieTracker();
-  const [weightVal, setWeightVal] = useState<number>(profile.weightKg);
+  const [weightDraft, setWeightDraft] = useState<string>(() =>
+    profile.weightKg.toFixed(1)
+  );
+
+  const currentParsed = parseMetricNumber(
+    weightDraft,
+    profile.weightKg,
+    30,
+    300,
+    1
+  );
+
+  const stepBy = (delta: number) => {
+    const next = Math.max(
+      30,
+      Math.min(300, Math.round((currentParsed + delta) * 10) / 10)
+    );
+    setWeightDraft(next.toFixed(1));
+  };
 
   return (
     <View>
       <Text style={styles.sheetTitle}>Log weight</Text>
-      <Text style={styles.sheetSub}>Small steps, big change</Text>
+      <Text style={styles.sheetSub}>
+        Tap the number to type directly, or use +/-
+      </Text>
 
       <View style={styles.bigStepperCenter}>
         <Pressable
-          onPress={() =>
-            setWeightVal((v) => Math.max(30, Math.round((v - 0.1) * 10) / 10))
-          }
+          onPress={() => stepBy(-0.1)}
           style={({ pressed }) => [
             styles.roundLightBtn,
             pressed ? { transform: [{ scale: 0.9 }] } : null,
@@ -316,15 +362,21 @@ function WeightSheetBody({ onClose }: { onClose: () => void }) {
           <PlateIcon name="minus" size={18} color={plateColors.ink} />
         </Pressable>
 
-        <Text style={styles.weightStepperNum}>
-          {weightVal.toFixed(1)}
-          <Text style={styles.weightStepperUnit}> kg</Text>
-        </Text>
+        <View style={styles.weightInputInlineWrap}>
+          <TextInput
+            value={weightDraft}
+            onChangeText={setWeightDraft}
+            keyboardType="decimal-pad"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
+            style={styles.weightStepperInput}
+          />
+          <Text style={styles.weightStepperUnit}>kg</Text>
+        </View>
 
         <Pressable
-          onPress={() =>
-            setWeightVal((v) => Math.min(250, Math.round((v + 0.1) * 10) / 10))
-          }
+          onPress={() => stepBy(0.1)}
           style={({ pressed }) => [
             styles.roundLightBtn,
             pressed ? { transform: [{ scale: 0.9 }] } : null,
@@ -336,21 +388,29 @@ function WeightSheetBody({ onClose }: { onClose: () => void }) {
 
       <Pressable
         onPress={async () => {
+          Keyboard.dismiss();
+          const finalWeight = parseMetricNumber(
+            weightDraft,
+            profile.weightKg,
+            30,
+            300,
+            1
+          );
           const todayKey = toLocalDateKey();
           await updateProfile({
-            weightKg: weightVal,
+            weightKg: finalWeight,
             weightHistory: upsertWeightLogPoint(
               profile.weightHistory,
               todayKey,
-              weightVal
+              finalWeight
             ),
           });
           onClose();
-          showToast(`Weight logged · ${weightVal.toFixed(1)} kg`);
+          showToast(`Weight logged · ${finalWeight.toFixed(1)} kg`);
         }}
         style={styles.sheetPrimaryBtn}
       >
-        <Text style={styles.sheetPrimaryBtnText}>Save</Text>
+        <Text style={styles.sheetPrimaryBtnText}>Save weight</Text>
       </Pressable>
     </View>
   );
@@ -431,20 +491,145 @@ function StepsSheetBody({ onClose }: { onClose: () => void }) {
   );
 }
 
-function ProfileSheetBody({ onClose }: { onClose: () => void }) {
+function ProfileSheetBody({
+  onClose,
+  keyboardVisible,
+  registerBackdropSave,
+}: {
+  onClose: () => void;
+  keyboardVisible: boolean;
+  registerBackdropSave: (fn: (() => Promise<void>) | null) => void;
+}) {
   const { profile, updateProfile, showToast } = useCalorieTracker();
   const [name, setName] = useState(profile.name);
   const [heightStr, setHeightStr] = useState(String(profile.heightCm));
+  const [currentWStr, setCurrentWStr] = useState(String(profile.weightKg));
   const [startWStr, setStartWStr] = useState(String(profile.startWeightKg));
   const [goalWStr, setGoalWStr] = useState(String(profile.goalWeightKg));
 
+  const commitSave = async (silentIfUnchanged: boolean) => {
+    const nextName = name.trim() || profile.name || 'You';
+    const parsedHeight = parseMetricNumber(
+      heightStr,
+      profile.heightCm,
+      120,
+      240,
+      0
+    );
+    const parsedCurrent = parseMetricNumber(
+      currentWStr,
+      profile.weightKg,
+      30,
+      300,
+      1
+    );
+    const parsedStart = parseMetricNumber(
+      startWStr,
+      profile.startWeightKg,
+      30,
+      300,
+      1
+    );
+    const parsedGoal = parseMetricNumber(
+      goalWStr,
+      profile.goalWeightKg,
+      30,
+      300,
+      1
+    );
+
+    const hasChanges =
+      nextName !== profile.name ||
+      parsedHeight !== profile.heightCm ||
+      parsedCurrent !== profile.weightKg ||
+      parsedStart !== profile.startWeightKg ||
+      parsedGoal !== profile.goalWeightKg;
+
+    if (!silentIfUnchanged || hasChanges) {
+      const todayKey = toLocalDateKey();
+      await updateProfile({
+        name: nextName,
+        heightCm: parsedHeight,
+        weightKg: parsedCurrent,
+        startWeightKg: parsedStart,
+        goalWeightKg: parsedGoal,
+        ...(parsedCurrent !== profile.weightKg
+          ? {
+              weightHistory: upsertWeightLogPoint(
+                profile.weightHistory,
+                todayKey,
+                parsedCurrent
+              ),
+            }
+          : {}),
+      });
+      showToast('Profile saved');
+    }
+
+    Keyboard.dismiss();
+    onClose();
+  };
+
+  const commitSaveRef = useRef(commitSave);
+  useEffect(() => {
+    commitSaveRef.current = commitSave;
+  });
+
+  useEffect(() => {
+    registerBackdropSave(() => commitSaveRef.current(true));
+    return () => registerBackdropSave(null);
+  }, [registerBackdropSave]);
+
+  const previewHeightCm = parseMetricNumber(
+    heightStr,
+    profile.heightCm,
+    120,
+    240,
+    0
+  );
+  const previewCurrentKg = parseMetricNumber(
+    currentWStr,
+    profile.weightKg,
+    30,
+    300,
+    1
+  );
+  const previewGoalKg = parseMetricNumber(
+    goalWStr,
+    profile.goalWeightKg,
+    30,
+    300,
+    1
+  );
+  const heightMeters = previewHeightCm / 100;
+  const previewBmi = previewCurrentKg / (heightMeters * heightMeters);
+  const goalDiff = Math.round((previewCurrentKg - previewGoalKg) * 10) / 10;
+
   return (
     <View style={{ gap: 10 }}>
-      <Text style={styles.sheetTitle}>Edit profile</Text>
-      <Text style={styles.sheetSub}>Used for BMI and weight goal charts</Text>
+      <Pressable
+        onPress={() => Keyboard.dismiss()}
+        style={styles.sheetHeaderRow}
+      >
+        <View style={{ flex: 1 }}>
+          <Text style={styles.sheetTitle}>Edit profile</Text>
+          <Text style={[styles.sheetSub, { marginBottom: 2 }]}>
+            Tap Save or tap outside to keep changes
+          </Text>
+        </View>
+        {keyboardVisible ? (
+          <Pressable
+            onPress={() => Keyboard.dismiss()}
+            style={styles.keyboardDonePill}
+          >
+            <PlateIcon name="check" size={14} color="#FFFFFF" />
+            <Text style={styles.keyboardDonePillText}>Done</Text>
+          </Pressable>
+        ) : null}
+      </Pressable>
 
       <View style={{ flexDirection: 'row', gap: 10 }}>
-        <View style={{ flex: 1.4 }}>
+        <View style={{ flex: 1.35 }}>
           <Text style={styles.fieldLabel}>Name</Text>
           <TextInput
             value={name}
@@ -452,18 +637,21 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
             style={styles.sheetInput}
             placeholder="Your name"
             placeholderTextColor={plateColors.faint}
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
           />
         </View>
         <View style={{ flex: 1 }}>
           <Text style={styles.fieldLabel}>
-            {`Height (cm · ${(
-              Math.max(120, Math.min(240, Number(heightStr) || 175)) / 100
-            ).toFixed(2)} m)`}
+            {`Height (cm · ${heightMeters.toFixed(2)} m)`}
           </Text>
           <TextInput
             value={heightStr}
             onChangeText={setHeightStr}
             keyboardType="numeric"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
             style={styles.sheetInput}
           />
         </View>
@@ -471,11 +659,14 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
 
       <View style={{ flexDirection: 'row', gap: 10 }}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.fieldLabel}>Starting weight (kg)</Text>
+          <Text style={styles.fieldLabel}>Current weight (kg)</Text>
           <TextInput
-            value={startWStr}
-            onChangeText={setStartWStr}
+            value={currentWStr}
+            onChangeText={setCurrentWStr}
             keyboardType="decimal-pad"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
             style={styles.sheetInput}
           />
         </View>
@@ -485,49 +676,82 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
             value={goalWStr}
             onChangeText={setGoalWStr}
             keyboardType="decimal-pad"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
             style={styles.sheetInput}
           />
         </View>
       </View>
 
-      <Pressable
-        onPress={async () => {
-          const parsedStart = Math.max(
-            30,
-            Math.min(
-              300,
-              Math.round((Number(startWStr) || profile.startWeightKg) * 10) / 10
-            )
-          );
-          const parsedGoal = Math.max(
-            30,
-            Math.min(
-              300,
-              Math.round((Number(goalWStr) || profile.goalWeightKg) * 10) / 10
-            )
-          );
-          await updateProfile({
-            name: name.trim() || 'You',
-            heightCm: Math.max(120, Math.min(240, Number(heightStr) || 175)),
-            startWeightKg: parsedStart,
-            goalWeightKg: parsedGoal,
-          });
-          onClose();
-          showToast('Profile saved');
-        }}
-        style={[styles.sheetPrimaryBtn, { marginTop: 6 }]}
-      >
-        <Text style={styles.sheetPrimaryBtnText}>Save profile</Text>
-      </Pressable>
+      <View style={{ flexDirection: 'row', gap: 10, alignItems: 'flex-end' }}>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.fieldLabel}>Starting weight (kg)</Text>
+          <TextInput
+            value={startWStr}
+            onChangeText={setStartWStr}
+            keyboardType="decimal-pad"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
+            style={styles.sheetInput}
+          />
+        </View>
+        <Pressable
+          onPress={() => Keyboard.dismiss()}
+          style={styles.profileLiveSummaryBox}
+        >
+          <Text style={styles.profileLiveSummaryTop}>
+            {`BMI ${previewBmi.toFixed(1)}`}
+          </Text>
+          <Text style={styles.profileLiveSummarySub} numberOfLines={1}>
+            {goalDiff === 0
+              ? 'At goal weight'
+              : goalDiff > 0
+                ? `${goalDiff.toFixed(1)} kg to goal`
+                : `+${Math.abs(goalDiff).toFixed(1)} kg target`}
+          </Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.profileActionsRow}>
+        <Pressable
+          onPress={() => {
+            Keyboard.dismiss();
+            onClose();
+          }}
+          style={styles.sheetCancelBtn}
+        >
+          <Text style={styles.sheetCancelBtnText}>Cancel</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() => void commitSave(false)}
+          style={[styles.sheetPrimaryBtn, { flex: 1.5 }]}
+        >
+          <Text style={styles.sheetPrimaryBtnText}>Save profile</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
 
 function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const isDesktopStage = useIsDesktopStage();
-  const { auth, startMealAnalysisJob, showToast } = useCalorieTracker();
+  const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardState();
+  const {
+    auth,
+    selectedDateKey,
+    saveMealEntry,
+    setActiveTab,
+    setDetailEntryId,
+    startMealAnalysisJob,
+    showToast,
+  } = useCalorieTracker();
 
   const cameraRef = useRef<CameraView | null>(null);
+  const lastScannedCodeRef = useRef<string>('');
   const [permission, requestPermission] = useCameraPermissions();
   const [facing, setFacing] = useState<CameraType>('back');
   const [cameraReady, setCameraReady] = useState(false);
@@ -538,6 +762,12 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     'scan' | 'barcode' | 'label' | 'library'
   >('scan');
   const [flashOn, setFlashOn] = useState(false);
+
+  const [barcodeInput, setBarcodeInput] = useState('');
+  const [barcodeLoading, setBarcodeLoading] = useState(false);
+  const [barcodeError, setBarcodeError] = useState<string | null>(null);
+  const [barcodeResult, setBarcodeResult] =
+    useState<BarcodeProductResult | null>(null);
 
   const [scanLineY] = useState(() => new Animated.Value(12));
   const [shutterFlash] = useState(() => new Animated.Value(0));
@@ -604,8 +834,87 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     return trimmed || undefined;
   };
 
+  const handleLookupBarcode = async (rawCode: string) => {
+    const clean = sanitizeBarcodeDigits(rawCode);
+    if (!clean || barcodeLoading) return;
+    Keyboard.dismiss();
+    setBarcodeInput(clean);
+    setBarcodeLoading(true);
+    setBarcodeError(null);
+    try {
+      const product = await lookupFoodBarcode(clean);
+      setBarcodeResult(product);
+      showToast(`Found: ${product.title}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Barcode lookup failed';
+      setBarcodeResult(null);
+      setBarcodeError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setBarcodeLoading(false);
+    }
+  };
+
+  const handleLogBarcodeProduct = async () => {
+    if (!barcodeResult) return;
+    const now = new Date();
+    const entry: MealEntry = {
+      id: `meal_${now.getTime()}_${Math.random().toString(36).slice(2, 7)}`,
+      dateKey: selectedDateKey,
+      createdAt: now.toISOString(),
+      mealType: inferMealTypeByHour(now),
+      title: barcodeResult.title,
+      photoUri: null,
+      userNotes: `Barcode: ${barcodeResult.barcode} (${barcodeResult.metricPortion})`,
+      aiProvider: 'manual',
+      aiSummary: barcodeResult.summary,
+      confidence: 'high',
+      calories: barcodeResult.calories,
+      protein: barcodeResult.protein,
+      carbs: barcodeResult.carbs,
+      fat: barcodeResult.fat,
+      healthScore: barcodeResult.healthScore,
+      items: barcodeResult.items,
+      entryType: 'food',
+      servings: 1,
+      status: 'done',
+    };
+    await saveMealEntry(entry);
+    setActiveTab('home');
+    setDetailEntryId(entry.id);
+    onClose();
+    showToast(`${barcodeResult.title} added`);
+  };
+
+  const handleAnalyzeNotesOnly = () => {
+    const notes = buildNotesWithMode();
+    if (!notes) return;
+    Keyboard.dismiss();
+    triggerShutterFlash();
+    setTimeout(() => {
+      onClose();
+      void startMealAnalysisJob({
+        userNotes: notes,
+        mimeType: 'image/jpeg',
+      });
+    }, 120);
+  };
+
   const handleCaptureAnalyze = async () => {
     if (capturing) return;
+
+    if (scanMode === 'barcode') {
+      if (barcodeResult) {
+        await handleLogBarcodeProduct();
+        return;
+      }
+      if (barcodeInput.trim()) {
+        await handleLookupBarcode(barcodeInput);
+        return;
+      }
+      showToast('Point camera at a barcode or enter the digits above');
+      return;
+    }
 
     if (pickedPhoto) {
       triggerShutterFlash();
@@ -623,6 +932,10 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     }
 
     if (!permission?.granted) {
+      if (userNotes.trim()) {
+        handleAnalyzeNotesOnly();
+        return;
+      }
       if (permission?.canAskAgain !== false) {
         const res = await requestPermission();
         if (!res.granted) {
@@ -651,6 +964,10 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     }
 
     if (!cameraRef.current || !cameraReady) {
+      if (userNotes.trim()) {
+        handleAnalyzeNotesOnly();
+        return;
+      }
       showToast('Camera is starting up…');
       return;
     }
@@ -661,6 +978,7 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
       const shot = await cameraRef.current.takePictureAsync({
         quality: 0.72,
         base64: true,
+        exif: false,
       });
       if (!shot?.uri) {
         setCapturing(false);
@@ -671,6 +989,9 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
       if (!b64 && shot.uri.startsWith('data:')) {
         const comma = shot.uri.indexOf(',');
         b64 = comma >= 0 ? shot.uri.slice(comma + 1) : '';
+      }
+      if (b64) {
+        b64 = stripImageMetadataBase64(b64);
       }
       const notes = buildNotesWithMode();
       onClose();
@@ -708,7 +1029,11 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const providerLabel = colors.providers[auth.activeProvider].label;
 
   return (
-    <View style={styles.scannerRoot}>
+    <KeyboardAvoidingView
+      behavior="padding"
+      keyboardVerticalOffset={insets.top}
+      style={styles.scannerRoot}
+    >
       {/* Live Camera Viewfinder (or User's Picked Photo — NEVER stock images) */}
       {pickedPhoto ? (
         <Image
@@ -729,17 +1054,19 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
           }}
           barcodeScannerSettings={
             scanMode === 'barcode'
-              ? { barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e', 'qr'] }
+              ? { barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e'] }
               : undefined
           }
           onBarcodeScanned={
-            scanMode === 'barcode'
+            scanMode === 'barcode' && !barcodeLoading && !barcodeResult
               ? ({ data }) => {
-                  if (data && !userNotes.includes(data)) {
-                    setUserNotes((prev) =>
-                      prev ? `${prev} (Barcode: ${data})` : `Barcode: ${data}`
-                    );
-                    showToast(`Barcode scanned: ${data}`);
+                  const clean = sanitizeBarcodeDigits(data || '');
+                  if (
+                    /^\d{6,18}$/.test(clean) &&
+                    clean !== lastScannedCodeRef.current
+                  ) {
+                    lastScannedCodeRef.current = clean;
+                    void handleLookupBarcode(clean);
                   }
                 }
               : undefined
@@ -786,15 +1113,85 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
         </Pressable>
       </View>
 
-      {/* Center Scan Frame + Animated Scanline (or Permission Prompt) */}
+      {/* Center Scan Frame + Animated Scanline (or Barcode Result / Permission Prompt) */}
       <View style={styles.scannerCenterArea}>
-        {!pickedPhoto && permission && !permission.granted ? (
+        {scanMode === 'barcode' && barcodeResult ? (
+          <View style={[styles.barcodeResultCard, cardShadow]}>
+            <View style={styles.barcodeResultTopRow}>
+              <View style={styles.barcodeBadgePill}>
+                <PlateIcon name="barcode" size={14} color={plateColors.ink} />
+                <Text style={styles.barcodeBadgeText}>
+                  {barcodeResult.barcode}
+                </Text>
+              </View>
+              <Text style={styles.barcodePortionPill}>
+                {`Per ${barcodeResult.metricPortion}`}
+              </Text>
+            </View>
+
+            <Text style={styles.barcodeTitleText} numberOfLines={2}>
+              {barcodeResult.title}
+            </Text>
+
+            <View style={styles.barcodeMetricsRow}>
+              <View style={styles.barcodeMetricBox}>
+                <Text style={styles.barcodeMetricVal}>
+                  {barcodeResult.calories}
+                </Text>
+                <Text style={styles.barcodeMetricLbl}>kcal</Text>
+              </View>
+              <View style={styles.barcodeMetricBox}>
+                <Text
+                  style={[styles.barcodeMetricVal, { color: plateColors.protein }]}
+                >
+                  {`${barcodeResult.protein} g`}
+                </Text>
+                <Text style={styles.barcodeMetricLbl}>Protein</Text>
+              </View>
+              <View style={styles.barcodeMetricBox}>
+                <Text
+                  style={[styles.barcodeMetricVal, { color: plateColors.carbs }]}
+                >
+                  {`${barcodeResult.carbs} g`}
+                </Text>
+                <Text style={styles.barcodeMetricLbl}>Carbs</Text>
+              </View>
+              <View style={styles.barcodeMetricBox}>
+                <Text
+                  style={[styles.barcodeMetricVal, { color: plateColors.fat }]}
+                >
+                  {`${barcodeResult.fat} g`}
+                </Text>
+                <Text style={styles.barcodeMetricLbl}>Fat</Text>
+              </View>
+            </View>
+
+            <View style={styles.barcodeActionsRow}>
+              <Pressable
+                onPress={() => {
+                  lastScannedCodeRef.current = '';
+                  setBarcodeResult(null);
+                  setBarcodeError(null);
+                }}
+                style={styles.barcodeResetBtn}
+              >
+                <Text style={styles.barcodeResetBtnText}>Scan another</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => void handleLogBarcodeProduct()}
+                style={styles.barcodeLogBtn}
+              >
+                <Text style={styles.barcodeLogBtnText}>Add to Log</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : !pickedPhoto && permission && !permission.granted && scanMode !== 'barcode' ? (
           <View style={styles.permissionCard}>
             <PlateIcon name="camera" size={28} color="#FFFFFF" />
             <Text style={styles.permissionTitle}>Camera Access Required</Text>
             <Text style={styles.permissionSub}>
-              Allow Plate to use your camera so you can point at your meal and
-              scan calories directly.
+              Allow Plate to use your camera so you can point at your meal, or
+              upload a photo / type gram details below.
             </Text>
             <Pressable
               onPress={() => {
@@ -834,7 +1231,7 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
             {pickedPhoto
               ? 'Photo ready · tap shutter to analyze'
               : scanMode === 'barcode'
-                ? 'Point camera at package barcode'
+                ? barcodeError || 'Point camera at barcode or enter digits below'
                 : scanMode === 'label'
                   ? 'Point camera at nutrition facts label'
                   : 'Point camera at your meal & tap shutter'}
@@ -850,18 +1247,66 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
           ) : null}
         </View>
 
-        {/* Optional Grams / mL / Ingredients Context Input */}
-        <View style={styles.notesGlassWrap}>
-          <PlateIcon name="sparkle" size={15} color="rgba(255,255,255,0.8)" />
-          <TextInput
-            value={userNotes}
-            onChangeText={setUserNotes}
-            placeholder="Optional: g or mL (e.g. 180 g chicken, 250 mL milk)…"
-            placeholderTextColor="rgba(255,255,255,0.62)"
-            style={styles.notesGlassInput}
-            returnKeyType="done"
-          />
-        </View>
+        {scanMode === 'barcode' ? (
+          <View style={styles.notesGlassWrap}>
+            <PlateIcon name="barcode" size={15} color="rgba(255,255,255,0.85)" />
+            <TextInput
+              value={barcodeInput}
+              onChangeText={(txt) => {
+                setBarcodeInput(txt);
+                if (barcodeError) setBarcodeError(null);
+              }}
+              placeholder="Enter EAN / UPC barcode (e.g. 3017620422003)…"
+              placeholderTextColor="rgba(255,255,255,0.62)"
+              keyboardType="number-pad"
+              returnKeyType="search"
+              onSubmitEditing={() => void handleLookupBarcode(barcodeInput)}
+              style={styles.notesGlassInput}
+            />
+            <Pressable
+              onPress={() => void handleLookupBarcode(barcodeInput)}
+              disabled={barcodeLoading || !barcodeInput.trim()}
+              style={[
+                styles.notesActionPill,
+                !barcodeInput.trim() ? { opacity: 0.45 } : null,
+              ]}
+            >
+              {barcodeLoading ? (
+                <ActivityIndicator size="small" color={plateColors.ink} />
+              ) : (
+                <Text style={styles.notesActionPillText}>Look up</Text>
+              )}
+            </Pressable>
+          </View>
+        ) : (
+          <View style={styles.notesGlassWrap}>
+            <PlateIcon name="sparkle" size={15} color="rgba(255,255,255,0.8)" />
+            <TextInput
+              value={userNotes}
+              onChangeText={setUserNotes}
+              placeholder="Optional: g or mL (e.g. 180 g chicken, 250 mL milk)…"
+              placeholderTextColor="rgba(255,255,255,0.62)"
+              style={styles.notesGlassInput}
+              returnKeyType="done"
+              onSubmitEditing={() => Keyboard.dismiss()}
+            />
+            {userNotes.trim() && !pickedPhoto ? (
+              <Pressable
+                onPress={handleAnalyzeNotesOnly}
+                style={styles.notesActionPill}
+              >
+                <Text style={styles.notesActionPillText}>Analyze</Text>
+              </Pressable>
+            ) : keyboard.visible ? (
+              <Pressable
+                onPress={() => Keyboard.dismiss()}
+                style={styles.liveCamChip}
+              >
+                <Text style={styles.liveCamChipText}>Done</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        )}
       </View>
 
       {/* Bottom Modes + Shutter */}
@@ -947,7 +1392,7 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
         pointerEvents="none"
         style={[styles.flashOverlay, { opacity: shutterFlash }]}
       />
-    </View>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -959,6 +1404,8 @@ function NutritionDetailContent({
   onClose: () => void;
 }) {
   const isDesktopStage = useIsDesktopStage();
+  const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardState();
   const {
     saveMealEntry,
     removeMealEntry,
@@ -1044,7 +1491,11 @@ function NutritionDetailContent({
       : 'AI estimate · 94% confidence';
 
   return (
-    <View style={styles.detailRoot}>
+    <KeyboardAvoidingView
+      behavior="padding"
+      keyboardVerticalOffset={insets.top}
+      style={styles.detailRoot}
+    >
       <ScrollView
         style={{ flex: 1 }}
         contentContainerStyle={{ paddingBottom: 112 }}
@@ -1325,7 +1776,17 @@ function NutritionDetailContent({
           <Text style={styles.btnDarkText}>Done</Text>
         </Pressable>
       </LinearGradient>
-    </View>
+
+      {keyboard.visible ? (
+        <Pressable
+          onPress={() => Keyboard.dismiss()}
+          style={[styles.floatingKeyboardDone, { top: isDesktopStage ? 56 : 14 }]}
+        >
+          <PlateIcon name="check" size={14} color="#FFFFFF" />
+          <Text style={styles.keyboardDonePillText}>Hide keyboard</Text>
+        </Pressable>
+      ) : null}
+    </KeyboardAvoidingView>
   );
 }
 
@@ -1335,6 +1796,8 @@ export function PlateOverlays({
   onChangeSheet,
 }: PlateOverlaysProps) {
   const isDesktopStage = useIsDesktopStage();
+  const insets = useSafeAreaInsets();
+  const keyboard = useKeyboardState();
   const {
     activeTab,
     setActiveTab,
@@ -1345,11 +1808,16 @@ export function PlateOverlays({
     meals,
     removeMealEntry,
     toastMessage,
+    toastTone,
     showToast,
+    lastAIError,
+    clearLastAIError,
+    openAILogsInSettings,
     selectedDateKey,
   } = useCalorieTracker();
 
   const [quickOpen, setQuickOpen] = useState(false);
+  const profileBackdropSaveRef = useRef<(() => Promise<void>) | null>(null);
 
   const detailEntry = detailEntryId
     ? meals.find((m) => m.id === detailEntryId) ?? null
@@ -1391,9 +1859,14 @@ export function PlateOverlays({
       {/* Backdrop for Quick Actions or Bottom Sheet */}
       {quickOpen || activeSheet ? (
         <Pressable
-          onPress={() => {
+          onPress={async () => {
+            Keyboard.dismiss();
             setQuickOpen(false);
-            onChangeSheet(null);
+            if (activeSheet === 'profile' && profileBackdropSaveRef.current) {
+              await profileBackdropSaveRef.current();
+            } else {
+              onChangeSheet(null);
+            }
           }}
           style={[
             styles.backdrop,
@@ -1488,64 +1961,111 @@ export function PlateOverlays({
 
       {/* Bottom Sheet */}
       {activeSheet ? (
-        <View style={styles.bottomSheet}>
-          <View style={styles.grabber} />
-          {activeSheet === 'saved' ? (
-            <LibrarySheetBody
-              key="saved"
-              savedOnly
-              onClose={() => onChangeSheet(null)}
-            />
-          ) : null}
-          {activeSheet === 'db' ? (
-            <LibrarySheetBody
-              key="db"
-              savedOnly={false}
-              onClose={() => onChangeSheet(null)}
-            />
-          ) : null}
-          {activeSheet === 'exercise' ? (
-            <ExerciseSheetBody onClose={() => onChangeSheet(null)} />
-          ) : null}
-          {activeSheet === 'weight' ? (
-            <WeightSheetBody key="weight" onClose={() => onChangeSheet(null)} />
-          ) : null}
-          {activeSheet === 'steps' ? (
-            <StepsSheetBody
-              key={selectedDateKey}
-              onClose={() => onChangeSheet(null)}
-            />
-          ) : null}
-          {activeSheet === 'profile' ? (
-            <ProfileSheetBody
-              key="profile"
-              onClose={() => onChangeSheet(null)}
-            />
-          ) : null}
-          {activeSheet === 'exerciseDetail' && selectedExercise ? (
-            <View style={{ gap: 12 }}>
-              <Text style={styles.sheetTitle}>{selectedExercise.title}</Text>
-              <Text style={styles.sheetSub}>
-                {`${selectedExercise.calories} kcal burned · ${
-                  selectedExercise.exerciseMinutes ?? 30
-                } min · ${selectedExercise.exerciseIntensity ?? 'Medium'} intensity`}
-              </Text>
-              <Pressable
-                onPress={async () => {
-                  await removeMealEntry(selectedExercise.id);
-                  onChangeSheet(null);
-                  showToast('Workout removed');
-                }}
-                style={[
-                  styles.sheetPrimaryBtn,
-                  { backgroundColor: plateColors.danger },
-                ]}
-              >
-                <Text style={styles.sheetPrimaryBtnText}>Remove workout</Text>
-              </Pressable>
+        <KeyboardAvoidingView
+          behavior="padding"
+          keyboardVerticalOffset={insets.top}
+          pointerEvents="box-none"
+          style={styles.sheetHost}
+        >
+          <View
+            style={[
+              styles.bottomSheet,
+              keyboard.visible ? styles.bottomSheetKeyboardOpen : null,
+            ]}
+          >
+            <View style={styles.grabberRow}>
+              <View style={styles.grabberSpacer} />
+              <View style={styles.grabber} />
+              <View style={styles.grabberRight}>
+                {keyboard.visible && activeSheet !== 'profile' ? (
+                  <Pressable
+                    onPress={() => Keyboard.dismiss()}
+                    style={styles.keyboardDonePill}
+                  >
+                    <PlateIcon name="check" size={13} color="#FFFFFF" />
+                    <Text style={styles.keyboardDonePillText}>Done</Text>
+                  </Pressable>
+                ) : null}
+              </View>
             </View>
-          ) : null}
-        </View>
+
+            {activeSheet === 'saved' ? (
+              <LibrarySheetBody
+                key="saved"
+                savedOnly
+                onClose={() => onChangeSheet(null)}
+              />
+            ) : null}
+            {activeSheet === 'db' ? (
+              <LibrarySheetBody
+                key="db"
+                savedOnly={false}
+                onClose={() => onChangeSheet(null)}
+              />
+            ) : null}
+            {activeSheet !== 'saved' && activeSheet !== 'db' ? (
+              <ScrollView
+                style={styles.sheetScroll}
+                contentContainerStyle={styles.sheetScrollContent}
+                keyboardShouldPersistTaps="handled"
+                showsVerticalScrollIndicator={false}
+              >
+                {activeSheet === 'exercise' ? (
+                  <ExerciseSheetBody onClose={() => onChangeSheet(null)} />
+                ) : null}
+                {activeSheet === 'weight' ? (
+                  <WeightSheetBody
+                    key="weight"
+                    onClose={() => onChangeSheet(null)}
+                  />
+                ) : null}
+                {activeSheet === 'steps' ? (
+                  <StepsSheetBody
+                    key={selectedDateKey}
+                    onClose={() => onChangeSheet(null)}
+                  />
+                ) : null}
+                {activeSheet === 'profile' ? (
+                  <ProfileSheetBody
+                    key="profile"
+                    keyboardVisible={keyboard.visible}
+                    registerBackdropSave={(fn) => {
+                      profileBackdropSaveRef.current = fn;
+                    }}
+                    onClose={() => onChangeSheet(null)}
+                  />
+                ) : null}
+                {activeSheet === 'exerciseDetail' && selectedExercise ? (
+                  <View style={{ gap: 12 }}>
+                    <Text style={styles.sheetTitle}>
+                      {selectedExercise.title}
+                    </Text>
+                    <Text style={styles.sheetSub}>
+                      {`${selectedExercise.calories} kcal burned · ${
+                        selectedExercise.exerciseMinutes ?? 30
+                      } min · ${selectedExercise.exerciseIntensity ?? 'Medium'} intensity`}
+                    </Text>
+                    <Pressable
+                      onPress={async () => {
+                        await removeMealEntry(selectedExercise.id);
+                        onChangeSheet(null);
+                        showToast('Workout removed');
+                      }}
+                      style={[
+                        styles.sheetPrimaryBtn,
+                        { backgroundColor: plateColors.danger },
+                      ]}
+                    >
+                      <Text style={styles.sheetPrimaryBtnText}>
+                        Remove workout
+                      </Text>
+                    </Pressable>
+                  </View>
+                ) : null}
+              </ScrollView>
+            ) : null}
+          </View>
+        </KeyboardAvoidingView>
       ) : null}
 
       {/* Full-Screen Nutrition Detail */}
@@ -1571,14 +2091,96 @@ export function PlateOverlays({
             { top: isDesktopStage ? 58 : 14 },
           ]}
         >
-          <View style={styles.toastPill}>
-            <PlateIcon name="check" size={16} color={plateColors.ok} />
-            <Text style={styles.toastText} numberOfLines={1}>
+          <View
+            style={[
+              styles.toastPill,
+              toastTone === 'error' ? styles.toastPillError : null,
+            ]}
+          >
+            <PlateIcon
+              name={toastTone === 'error' ? 'x' : 'check'}
+              size={16}
+              color={toastTone === 'error' ? '#FF6B6B' : plateColors.ok}
+            />
+            <Text style={styles.toastText} numberOfLines={2}>
               {toastMessage}
             </Text>
           </View>
         </View>
       ) : null}
+
+      {/* Full AI Error Diagnostic Modal */}
+      <Modal
+        visible={Boolean(lastAIError)}
+        transparent
+        animationType="fade"
+        onRequestClose={clearLastAIError}
+      >
+        <View style={styles.aiErrorBackdrop}>
+          <View style={[styles.aiErrorCard, cardShadow]}>
+            <View style={styles.aiErrorHeaderRow}>
+              <View style={styles.aiErrorIconBadge}>
+                <PlateIcon name="x" size={18} color="#FFFFFF" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.aiErrorTitle}>
+                  {lastAIError?.title || 'AI Request Failed'}
+                </Text>
+                <Text style={styles.aiErrorMeta}>
+                  {lastAIError
+                    ? `${colors.providers[lastAIError.provider].label} · ${new Date(
+                        lastAIError.timestamp
+                      ).toLocaleTimeString()}`
+                    : ''}
+                </Text>
+              </View>
+            </View>
+
+            <ScrollView
+              style={styles.aiErrorBodyScroll}
+              showsVerticalScrollIndicator
+            >
+              <Text selectable style={styles.aiErrorBodyText}>
+                {lastAIError?.message || ''}
+              </Text>
+            </ScrollView>
+
+            <View style={styles.aiErrorBtnRow}>
+              <Pressable
+                onPress={async () => {
+                  if (!lastAIError) return;
+                  await Clipboard.setStringAsync(
+                    `[${lastAIError.timestamp}] ${lastAIError.title} (${lastAIError.provider})\n${lastAIError.message}`
+                  );
+                  showToast('Error copied to clipboard');
+                }}
+                style={styles.aiErrorSecondaryBtn}
+              >
+                <Text style={styles.aiErrorSecondaryBtnText}>Copy Error</Text>
+              </Pressable>
+
+              <Pressable
+                onPress={() => {
+                  onChangeSheet(null);
+                  openAILogsInSettings();
+                }}
+                style={styles.aiErrorSecondaryBtn}
+              >
+                <Text style={styles.aiErrorSecondaryBtnText}>
+                  AI Settings & Logs
+                </Text>
+              </Pressable>
+            </View>
+
+            <Pressable
+              onPress={clearLastAIError}
+              style={styles.sheetPrimaryBtn}
+            >
+              <Text style={styles.sheetPrimaryBtnText}>Dismiss</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </>
   );
 }
@@ -1686,27 +2288,86 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.65)',
     marginTop: 2,
   },
-  bottomSheet: {
+  sheetHost: {
     position: 'absolute',
+    top: 0,
     left: 0,
     right: 0,
     bottom: 0,
-    maxHeight: '85%',
+    justifyContent: 'flex-end',
+    zIndex: 50,
+  },
+  bottomSheet: {
+    width: '100%',
+    maxHeight: '90%',
     backgroundColor: plateColors.card,
     borderTopLeftRadius: 34,
     borderTopRightRadius: 34,
     paddingTop: 10,
     paddingHorizontal: 20,
-    paddingBottom: 32,
-    zIndex: 50,
+    paddingBottom: 30,
+  },
+  bottomSheetKeyboardOpen: {
+    maxHeight: '96%',
+    paddingBottom: 14,
+  },
+  grabberRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    minHeight: 24,
+  },
+  grabberSpacer: {
+    width: 72,
+  },
+  grabberRight: {
+    width: 72,
+    alignItems: 'flex-end',
   },
   grabber: {
     width: 40,
     height: 5,
     borderRadius: 5,
     backgroundColor: '#DCDCE0',
-    alignSelf: 'center',
-    marginBottom: 14,
+  },
+  sheetScroll: {
+    flexGrow: 0,
+  },
+  sheetScrollContent: {
+    paddingBottom: 4,
+  },
+  sheetHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  keyboardDonePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: plateColors.ink,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 99,
+  },
+  keyboardDonePillText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  floatingKeyboardDone: {
+    position: 'absolute',
+    right: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: plateColors.ink,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: 99,
+    zIndex: 75,
   },
   sheetTitle: {
     fontSize: 22,
@@ -1833,6 +2494,24 @@ const styles = StyleSheet.create({
     gap: 22,
     marginVertical: 18,
   },
+  weightInputInlineWrap: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 4,
+  },
+  weightStepperInput: {
+    minWidth: 112,
+    textAlign: 'center',
+    fontSize: 48,
+    fontWeight: '700',
+    color: plateColors.ink,
+    letterSpacing: -1.6,
+    fontVariant: ['tabular-nums'],
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 16,
+    backgroundColor: plateColors.chip,
+  },
   weightStepperNum: {
     fontSize: 52,
     fontWeight: '700',
@@ -1867,16 +2546,58 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
   sheetPrimaryBtn: {
-    height: 54,
+    height: 52,
     borderRadius: 99,
     backgroundColor: plateColors.ink,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 18,
   },
   sheetPrimaryBtnText: {
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  profileActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 4,
+  },
+  sheetCancelBtn: {
+    flex: 1,
+    height: 52,
+    borderRadius: 99,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  sheetCancelBtnText: {
+    color: plateColors.ink2,
+    fontSize: 15.5,
+    fontWeight: '600',
+  },
+  profileLiveSummaryBox: {
+    flex: 1,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: plateColors.bg,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+    paddingHorizontal: 12,
+    justifyContent: 'center',
+  },
+  profileLiveSummaryTop: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
+  },
+  profileLiveSummarySub: {
+    fontSize: 11.5,
+    fontWeight: '500',
+    color: plateColors.muted,
   },
   fieldLabel: {
     fontSize: 12.5,
@@ -2074,6 +2795,113 @@ const styles = StyleSheet.create({
     flex: 1,
     color: '#FFFFFF',
     fontSize: 13,
+  },
+  notesActionPill: {
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 99,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 64,
+  },
+  notesActionPillText: {
+    color: plateColors.ink,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  barcodeResultCard: {
+    width: '100%',
+    maxWidth: 340,
+    backgroundColor: plateColors.card,
+    borderRadius: 24,
+    padding: 16,
+    gap: 12,
+  },
+  barcodeResultTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  barcodeBadgePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: plateColors.chip,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  barcodeBadgeText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: plateColors.ink2,
+    fontVariant: ['tabular-nums'],
+  },
+  barcodePortionPill: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.muted,
+  },
+  barcodeTitleText: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: plateColors.ink,
+    letterSpacing: -0.4,
+  },
+  barcodeMetricsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  barcodeMetricBox: {
+    flex: 1,
+    backgroundColor: plateColors.bg,
+    borderRadius: 14,
+    paddingVertical: 9,
+    paddingHorizontal: 6,
+    alignItems: 'center',
+  },
+  barcodeMetricVal: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
+  },
+  barcodeMetricLbl: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: plateColors.muted,
+    marginTop: 2,
+  },
+  barcodeActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  barcodeResetBtn: {
+    flex: 1,
+    height: 42,
+    borderRadius: 99,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  barcodeResetBtnText: {
+    fontSize: 13.5,
+    fontWeight: '600',
+    color: plateColors.ink,
+  },
+  barcodeLogBtn: {
+    flex: 1.35,
+    height: 42,
+    borderRadius: 99,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  barcodeLogBtnText: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
   scannerBottomArea: {
     paddingBottom: 32,
@@ -2483,15 +3311,97 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingVertical: 11,
     borderRadius: 99,
+    maxWidth: '94%',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 10 },
     shadowOpacity: 0.35,
     shadowRadius: 16,
     elevation: 8,
   },
+  toastPillError: {
+    backgroundColor: '#2B1216',
+    borderWidth: 1,
+    borderColor: 'rgba(255,107,107,0.45)',
+    borderRadius: 22,
+  },
   toastText: {
     color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '600',
+    flexShrink: 1,
+  },
+  aiErrorBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.54)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 22,
+  },
+  aiErrorCard: {
+    width: '100%',
+    maxWidth: 380,
+    backgroundColor: plateColors.card,
+    borderRadius: 28,
+    padding: 20,
+    gap: 12,
+  },
+  aiErrorHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  aiErrorIconBadge: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: plateColors.danger,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aiErrorTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: plateColors.ink,
+    letterSpacing: -0.3,
+  },
+  aiErrorMeta: {
+    fontSize: 12.5,
+    color: plateColors.muted,
+    marginTop: 2,
+  },
+  aiErrorBodyScroll: {
+    maxHeight: 240,
+    backgroundColor: '#16161A',
+    borderRadius: 16,
+    paddingHorizontal: 13,
+    paddingVertical: 11,
+  },
+  aiErrorBodyText: {
+    color: '#F4F4F6',
+    fontSize: 12.5,
+    lineHeight: 18,
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+      default: 'monospace',
+    }),
+  },
+  aiErrorBtnRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  aiErrorSecondaryBtn: {
+    flex: 1,
+    height: 42,
+    borderRadius: 14,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  aiErrorSecondaryBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: plateColors.ink,
   },
 });

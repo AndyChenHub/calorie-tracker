@@ -1,6 +1,7 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import { Image, ImageSourcePropType, Platform } from 'react-native';
+import { stripImageMetadataBase64 } from '../utils/imagePrivacy';
 
 export interface PickedMealPhoto {
   uri: string;
@@ -24,6 +25,7 @@ export async function capturePhotoFromCamera(): Promise<PickedMealPhoto | null> 
     mediaTypes: ['images'],
     quality: 0.72,
     base64: true,
+    exif: false,
     allowsEditing: false,
   });
 
@@ -48,6 +50,7 @@ export async function pickPhotoFromLibrary(): Promise<PickedMealPhoto | null> {
     mediaTypes: ['images'],
     quality: 0.72,
     base64: true,
+    exif: false,
     allowsEditing: false,
   });
 
@@ -72,6 +75,10 @@ async function normalizeAsset(
       const file = new File(asset.uri);
       base64 = await file.base64();
     }
+  }
+
+  if (base64) {
+    base64 = stripImageMetadataBase64(base64);
   }
 
   const displayUri =

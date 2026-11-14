@@ -4,7 +4,9 @@ import {
   DEFAULT_USER_PROFILE,
 } from '../constants/plateCatalog';
 import {
+  AIDiagnosticLogEntry,
   AppPreferences,
+  ChatGPTOnDeviceSession,
   DailySummary,
   MealEntry,
   ProviderAuthConfig,
@@ -36,7 +38,10 @@ const WEB_MEALS_KEY = 'plate_meals_v2';
 const LEGACY_WEB_MEALS_KEY = 'calorielens_meals_v1';
 const WEB_GOALS_KEY = 'plate_goals_v2';
 const LEGACY_WEB_GOALS_KEY = 'calorielens_goals_v1';
-const WEB_AUTH_KEY = 'calorielens_auth_v1';
+const LEGACY_WEB_AUTH_KEY = 'calorielens_auth_v1';
+const WEB_AUTH_PREFS_KEY = 'plate_auth_prefs_v2';
+const WEB_AUTH_SECRETS_SESSION_KEY = 'plate_auth_secrets_v2';
+const WEB_AI_LOGS_SESSION_KEY = 'plate_ai_diagnostic_logs_v1';
 const WEB_ONBOARDING_KEY = 'calorielens_onboarded_v1';
 const WEB_PROFILE_KEY = 'plate_profile_v1';
 const LEGACY_WEB_PROFILE_KEY = 'calorielens_profile_v1';
@@ -73,6 +78,7 @@ export interface PendingChatGPTPkceFlow {
   redirectUri: string;
   clientIdSent: string;
   extAgentHostId: string;
+  oauthVariant?: 'siwc' | 'codex';
   createdAt: number;
 }
 
@@ -309,22 +315,186 @@ export async function saveHasPurgedLegacyDemoSeed(
   }
 }
 
+interface WebAuthSecrets {
+  companionToken?: string;
+  claudeApiKey?: string;
+  openaiApiKey?: string;
+  geminiApiKey?: string;
+  chatgptAccessToken?: string;
+  chatgptRefreshToken?: string;
+}
+
+interface WebAuthNonSecretPrefs {
+  activeProvider?: ProviderAuthConfig['activeProvider'];
+  companionUrl?: string;
+  claudeModel?: string;
+  gptModel?: string;
+  geminiModel?: string;
+  chatgptOAuthMeta?: Omit<
+    ChatGPTOnDeviceSession,
+    'accessToken' | 'refreshToken'
+  >;
+}
+
 export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
   const defaults = getDefaultAuthConfig();
+  let nonSecret: WebAuthNonSecretPrefs = {};
+  let secrets: WebAuthSecrets = {};
+
   try {
-    const raw = globalThis.localStorage?.getItem(WEB_AUTH_KEY);
-    if (raw) return { ...defaults, ...JSON.parse(raw) };
+    const rawPrefs = globalThis.localStorage?.getItem(WEB_AUTH_PREFS_KEY);
+    if (rawPrefs) {
+      nonSecret = JSON.parse(rawPrefs) as WebAuthNonSecretPrefs;
+    }
   } catch {
-    // ignore
+    nonSecret = {};
   }
-  return defaults;
+
+  try {
+    const rawSecrets = globalThis.sessionStorage?.getItem(
+      WEB_AUTH_SECRETS_SESSION_KEY
+    );
+    if (rawSecrets) {
+      secrets = JSON.parse(rawSecrets) as WebAuthSecrets;
+    }
+  } catch {
+    secrets = {};
+  }
+
+  // Migrate and immediately purge any legacy plaintext localStorage auth blob
+  try {
+    const legacyRaw = globalThis.localStorage?.getItem(LEGACY_WEB_AUTH_KEY);
+    if (legacyRaw) {
+      const legacy = JSON.parse(legacyRaw) as Partial<ProviderAuthConfig>;
+      nonSecret = {
+        activeProvider: legacy.activeProvider ?? nonSecret.activeProvider,
+        companionUrl: legacy.companionUrl ?? nonSecret.companionUrl,
+        claudeModel: legacy.claudeModel ?? nonSecret.claudeModel,
+        gptModel: legacy.gptModel ?? nonSecret.gptModel,
+        geminiModel: legacy.geminiModel ?? nonSecret.geminiModel,
+        chatgptOAuthMeta: legacy.chatgptOAuth
+          ? {
+              connected: Boolean(legacy.chatgptOAuth.connected),
+              clientId: legacy.chatgptOAuth.clientId || '',
+              extAgentHostId: legacy.chatgptOAuth.extAgentHostId || '',
+              expiresAt: legacy.chatgptOAuth.expiresAt || 0,
+              scope: legacy.chatgptOAuth.scope,
+              email: legacy.chatgptOAuth.email,
+              name: legacy.chatgptOAuth.name,
+              chatgptAccountId: legacy.chatgptOAuth.chatgptAccountId,
+              oauthMode: legacy.chatgptOAuth.oauthMode,
+            }
+          : nonSecret.chatgptOAuthMeta,
+      };
+      secrets = {
+        companionToken: legacy.companionToken || secrets.companionToken || '',
+        claudeApiKey: legacy.claudeApiKey || secrets.claudeApiKey || '',
+        openaiApiKey: legacy.openaiApiKey || secrets.openaiApiKey || '',
+        geminiApiKey: legacy.geminiApiKey || secrets.geminiApiKey || '',
+        chatgptAccessToken:
+          legacy.chatgptOAuth?.accessToken || secrets.chatgptAccessToken || '',
+        chatgptRefreshToken:
+          legacy.chatgptOAuth?.refreshToken || secrets.chatgptRefreshToken || '',
+      };
+      globalThis.localStorage?.setItem(
+        WEB_AUTH_PREFS_KEY,
+        JSON.stringify(nonSecret)
+      );
+      globalThis.sessionStorage?.setItem(
+        WEB_AUTH_SECRETS_SESSION_KEY,
+        JSON.stringify(secrets)
+      );
+      globalThis.localStorage?.removeItem(LEGACY_WEB_AUTH_KEY);
+    }
+  } catch {
+    // ignore migration parse failure
+  }
+
+  const meta = nonSecret.chatgptOAuthMeta;
+  const accessToken = secrets.chatgptAccessToken || '';
+  const refreshToken = secrets.chatgptRefreshToken || '';
+  const hasTokens = Boolean(accessToken || refreshToken);
+  const chatgptOAuth: ChatGPTOnDeviceSession | undefined =
+    meta || hasTokens
+      ? {
+          connected: meta ? Boolean(meta.connected && hasTokens) : hasTokens,
+          accessToken,
+          refreshToken,
+          clientId: meta?.clientId || '',
+          extAgentHostId: meta?.extAgentHostId || '',
+          expiresAt: meta?.expiresAt || 0,
+          scope: meta?.scope,
+          email: meta?.email,
+          name: meta?.name,
+          chatgptAccountId: meta?.chatgptAccountId,
+          oauthMode: meta?.oauthMode,
+        }
+      : undefined;
+
+  return {
+    ...defaults,
+    activeProvider: nonSecret.activeProvider || defaults.activeProvider,
+    companionUrl: nonSecret.companionUrl || defaults.companionUrl,
+    claudeModel: nonSecret.claudeModel || defaults.claudeModel,
+    gptModel: nonSecret.gptModel || defaults.gptModel,
+    geminiModel: nonSecret.geminiModel || defaults.geminiModel,
+    companionToken: secrets.companionToken || '',
+    claudeApiKey: secrets.claudeApiKey || '',
+    openaiApiKey: secrets.openaiApiKey || '',
+    geminiApiKey: secrets.geminiApiKey || '',
+    chatgptOAuth,
+  };
 }
 
 export async function saveAuthConfig(config: ProviderAuthConfig): Promise<void> {
+  const oai = config.chatgptOAuth;
+  const nonSecret: WebAuthNonSecretPrefs = {
+    activeProvider: config.activeProvider,
+    companionUrl: config.companionUrl,
+    claudeModel: config.claudeModel,
+    gptModel: config.gptModel,
+    geminiModel: config.geminiModel,
+    chatgptOAuthMeta: oai
+      ? {
+          connected: Boolean(
+            oai.connected && (oai.accessToken || oai.refreshToken)
+          ),
+          clientId: oai.clientId || '',
+          extAgentHostId: oai.extAgentHostId || '',
+          expiresAt: oai.expiresAt || 0,
+          scope: oai.scope,
+          email: oai.email,
+          name: oai.name,
+          chatgptAccountId: oai.chatgptAccountId,
+          oauthMode: oai.oauthMode,
+        }
+      : undefined,
+  };
+  const secrets: WebAuthSecrets = {
+    companionToken: config.companionToken || '',
+    claudeApiKey: config.claudeApiKey || '',
+    openaiApiKey: config.openaiApiKey || '',
+    geminiApiKey: config.geminiApiKey || '',
+    chatgptAccessToken: oai?.connected ? oai.accessToken : '',
+    chatgptRefreshToken: oai?.connected ? oai.refreshToken : '',
+  };
+
   try {
-    globalThis.localStorage?.setItem(WEB_AUTH_KEY, JSON.stringify(config));
+    globalThis.localStorage?.setItem(
+      WEB_AUTH_PREFS_KEY,
+      JSON.stringify(nonSecret)
+    );
+    globalThis.localStorage?.removeItem(LEGACY_WEB_AUTH_KEY);
   } catch {
-    // ignore
+    // ignore storage write error
+  }
+  try {
+    globalThis.sessionStorage?.setItem(
+      WEB_AUTH_SECRETS_SESSION_KEY,
+      JSON.stringify(secrets)
+    );
+  } catch {
+    // ignore sessionStorage error
   }
 }
 
@@ -351,7 +521,10 @@ export async function saveOnboardingCompleted(
 
 export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow | null> {
   try {
-    const raw = globalThis.localStorage?.getItem(WEB_PENDING_PKCE_KEY);
+    const raw =
+      globalThis.sessionStorage?.getItem(WEB_PENDING_PKCE_KEY) ??
+      globalThis.localStorage?.getItem(WEB_PENDING_PKCE_KEY);
+    globalThis.localStorage?.removeItem(WEB_PENDING_PKCE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PendingChatGPTPkceFlow;
     if (
@@ -359,6 +532,7 @@ export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow |
       !parsed?.codeVerifier ||
       Date.now() - (parsed.createdAt || 0) > 20 * 60 * 1000
     ) {
+      globalThis.sessionStorage?.removeItem(WEB_PENDING_PKCE_KEY);
       return null;
     }
     return parsed;
@@ -371,10 +545,11 @@ export async function savePendingChatGPTPkce(
   flow: PendingChatGPTPkceFlow | null
 ): Promise<void> {
   try {
+    globalThis.localStorage?.removeItem(WEB_PENDING_PKCE_KEY);
     if (!flow) {
-      globalThis.localStorage?.removeItem(WEB_PENDING_PKCE_KEY);
+      globalThis.sessionStorage?.removeItem(WEB_PENDING_PKCE_KEY);
     } else {
-      globalThis.localStorage?.setItem(
+      globalThis.sessionStorage?.setItem(
         WEB_PENDING_PKCE_KEY,
         JSON.stringify(flow)
       );
@@ -384,8 +559,33 @@ export async function savePendingChatGPTPkce(
   }
 }
 
+export async function loadAIDiagnosticLogs(): Promise<AIDiagnosticLogEntry[]> {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(WEB_AI_LOGS_SESSION_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as AIDiagnosticLogEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveAIDiagnosticLogs(
+  logs: AIDiagnosticLogEntry[]
+): Promise<void> {
+  try {
+    const trimmed = logs.slice(-60);
+    globalThis.sessionStorage?.setItem(
+      WEB_AI_LOGS_SESSION_KEY,
+      JSON.stringify(trimmed)
+    );
+  } catch {
+    // ignore sessionStorage error
+  }
+}
+
 export async function ensureSettingsMirrored(): Promise<void> {
-  // Web storage persists directly in browser localStorage
+  // Web storage persists directly in browser storage
 }
 
 export async function hasStoredUserConfiguration(): Promise<boolean> {
@@ -400,10 +600,26 @@ export async function hasStoredUserConfiguration(): Promise<boolean> {
         store.getItem(LEGACY_WEB_PREFS_KEY) ||
         store.getItem(WEB_PROFILE_KEY) ||
         store.getItem(LEGACY_WEB_PROFILE_KEY) ||
-        store.getItem(WEB_AUTH_KEY)
+        store.getItem(WEB_AUTH_PREFS_KEY) ||
+        store.getItem(LEGACY_WEB_AUTH_KEY)
     );
   } catch {
     return false;
+  }
+}
+
+function sanitizeBackupCompanionUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return inferDefaultCompanionUrl();
+  try {
+    const parsed = new URL(trimmed);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return inferDefaultCompanionUrl();
   }
 }
 
@@ -419,6 +635,12 @@ export async function createPortableBackupJson(): Promise<string> {
       loadAllMeals(),
     ]);
 
+  const portableMeals: MealEntry[] = meals.map((m) => ({
+    ...m,
+    photoUri:
+      m.photoUri && m.photoUri.startsWith('file://') ? null : m.photoUri,
+  }));
+
   const payload: PlatePortableBackup = {
     schema: 'plate-backup-v1',
     exportedAt: new Date().toISOString(),
@@ -427,14 +649,14 @@ export async function createPortableBackupJson(): Promise<string> {
     preferences,
     authPreferences: {
       activeProvider: auth.activeProvider,
-      companionUrl: auth.companionUrl,
+      companionUrl: sanitizeBackupCompanionUrl(auth.companionUrl),
       claudeModel: auth.claudeModel,
       gptModel: auth.gptModel,
       geminiModel: auth.geminiModel,
     },
     waterByDate,
     stepsByDate,
-    meals,
+    meals: portableMeals,
   };
 
   return JSON.stringify(payload, null, 2);

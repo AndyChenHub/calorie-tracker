@@ -18,9 +18,9 @@ from typing import Any, Literal, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 # Load backend/.env if present
@@ -129,17 +129,90 @@ class AnalyzeRequest(BaseModel):
     model: Optional[str] = None
 
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 
-app = FastAPI(title="CalorieLens Companion Backend", version=APP_VERSION)
+
+def _parse_allowed_origins() -> list[str]:
+    defaults = [
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:19006",
+        "http://127.0.0.1:19006",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    raw_extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
+    if not raw_extra:
+        return defaults
+    extras = [o.strip().rstrip("/") for o in raw_extra.split(",") if o.strip()]
+    return list(dict.fromkeys(defaults + extras))
+
+
+ALLOWED_WEB_ORIGINS = _parse_allowed_origins()
+
+app = FastAPI(
+    title="CalorieLens Companion Backend",
+    version=APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_WEB_ORIGINS,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CalorieLens-Version"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next) -> Response:
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
+
+def redact_secrets(raw: str) -> str:
+    if not raw:
+        return ""
+    out = re.sub(r"Bearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", raw, flags=re.IGNORECASE)
+    out = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "sk-[REDACTED]", out)
+    out = re.sub(r"\bAIza[A-Za-z0-9_-]{16,}", "AIza[REDACTED]", out)
+    out = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        "[REDACTED_JWT]",
+        out,
+    )
+    out = re.sub(
+        r"\b((?:key|api_key|access_token|refresh_token|id_token|client_secret|code|code_verifier|token)=)[^&\s#\"']+",
+        r"\1[REDACTED]",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r'("(?:access_token|refresh_token|id_token|api_key|client_secret|code_verifier)"\s*:\s*")[^"]+"',
+        r'\1[REDACTED]"',
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
+def mask_email(email: Optional[str]) -> Optional[str]:
+    if not email or "@" not in email:
+        return None
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = f"{local[:1]}***"
+    else:
+        masked_local = f"{local[:2]}***"
+    return f"{masked_local}@{domain}"
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +262,17 @@ def load_oauth_store() -> dict[str, Any]:
 
 
 def save_oauth_store(store: dict[str, Any]) -> None:
-    OAUTH_STATE_PATH.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    tmp_path = OAUTH_STATE_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, OAUTH_STATE_PATH)
+    try:
+        os.chmod(OAUTH_STATE_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def generate_pkce_pair() -> tuple[str, str]:
@@ -317,10 +400,18 @@ def render_oauth_result_html(
     <button class="btn" onclick="finishWindow()">Return to CalorieLens</button>
   </div>
   <script>
+    try {{
+      history.replaceState(null, "", window.location.pathname);
+    }} catch (e) {{}}
     const payload = {payload_json};
+    const allowedTargets = {json.dumps(ALLOWED_WEB_ORIGINS)};
     try {{
       if (window.opener && !window.opener.closed) {{
-        window.opener.postMessage(payload, "*");
+        for (const targetOrigin of allowedTargets) {{
+          try {{
+            window.opener.postMessage(payload, targetOrigin);
+          }} catch (innerErr) {{}}
+        }}
       }}
     }} catch (e) {{}}
     function finishWindow() {{
@@ -339,7 +430,16 @@ def render_oauth_result_html(
   </script>
 </body>
 </html>"""
-    return HTMLResponse(content=page, status_code=200 if ok else 400)
+    return HTMLResponse(
+        content=page,
+        status_code=200 if ok else 400,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +668,7 @@ def verify_companion_token(authorization: Optional[str]) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Companion Bearer token.")
     provided = authorization.removeprefix("Bearer ").strip()
-    if provided != expected:
+    if not secrets.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="Invalid Companion Bearer token.")
 
 
@@ -727,8 +827,8 @@ async def get_status(authorization: Optional[str] = Header(default=None)):
         "lanUrls": lan_urls,
         "chatgptOAuth": {
             "connected": chatgpt_connected,
-            "email": oai.get("email"),
-            "name": oai.get("name"),
+            "email": mask_email(oai.get("email")),
+            "name": None,
             "directTokensScope": "chatgpt.tokens.use.direct" in chatgpt_scope
             if chatgpt_scope
             else chatgpt_connected,
@@ -736,7 +836,7 @@ async def get_status(authorization: Optional[str] = Header(default=None)):
         "googleOAuth": {
             "configured": google_client_configured,
             "connected": google_connected,
-            "email": g_state.get("email"),
+            "email": mask_email(g_state.get("email")),
         },
         "serverProviders": {
             "antigravity": agy_ready,
@@ -745,7 +845,7 @@ async def get_status(authorization: Optional[str] = Header(default=None)):
             "gemini": bool((os.getenv("GEMINI_API_KEY") or "").strip()) or google_connected,
         },
         "message": (
-            f"Signed in to ChatGPT ({oai.get('email') or 'OpenAI SSO'})"
+            f"Signed in to ChatGPT ({mask_email(oai.get('email')) or 'OpenAI SSO'})"
             if chatgpt_connected
             else (
                 "Antigravity SDK ready on Companion Server."
@@ -838,7 +938,7 @@ async def openai_oauth_callback(
                     provider_label="OpenAI ChatGPT",
                     provider_key="gpt",
                     headline="Token Exchange Failed",
-                    detail=f"OpenAI returned {res.status_code}: {res.text[:240]}",
+                    detail=redact_secrets(f"OpenAI returned {res.status_code}: {res.text[:240]}"),
                 )
             token_data = res.json()
     except Exception as exc:
@@ -847,7 +947,7 @@ async def openai_oauth_callback(
             provider_label="OpenAI ChatGPT",
             provider_key="gpt",
             headline="Network Error Contacting OpenAI",
-            detail=str(exc),
+            detail=redact_secrets(str(exc)),
         )
 
     id_claims = decode_jwt_claims(token_data.get("id_token")) or decode_jwt_claims(
@@ -945,7 +1045,7 @@ async def google_oauth_callback(
                 provider_label="Google AI",
                 provider_key="antigravity",
                 headline="Google Token Exchange Failed",
-                detail=f"Google returned {res.status_code}: {res.text[:240]}",
+                detail=redact_secrets(f"Google returned {res.status_code}: {res.text[:240]}"),
             )
         token_data = res.json()
 
@@ -1066,11 +1166,11 @@ async def analyze_with_antigravity(
         )
     parts.append({"text": f"{NUTRITION_SYSTEM_PROMPT}\n\n{user_prompt}"})
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if effective_key:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={effective_key}"
+        headers["x-goog-api-key"] = effective_key
     else:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         headers["Authorization"] = f"Bearer {google_oauth_token}"
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1087,7 +1187,8 @@ async def analyze_with_antigravity(
         )
         if res.status_code >= 400:
             raise HTTPException(
-                status_code=res.status_code, detail=f"Gemini API error: {res.text}"
+                status_code=res.status_code,
+                detail=redact_secrets(f"Gemini API error: {res.text}"),
             )
         data = res.json()
         text_content = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -1141,7 +1242,8 @@ async def analyze_with_claude(
         )
         if res.status_code >= 400:
             raise HTTPException(
-                status_code=res.status_code, detail=f"Claude API error: {res.text}"
+                status_code=res.status_code,
+                detail=redact_secrets(f"Claude API error: {res.text}"),
             )
         data = res.json()
         text_out = "".join(
@@ -1192,7 +1294,8 @@ async def analyze_with_gpt(req: AnalyzeRequest, image_bytes: Optional[bytes]) ->
             )
             if res.status_code >= 400:
                 raise HTTPException(
-                    status_code=res.status_code, detail=f"OpenAI API error: {res.text}"
+                    status_code=res.status_code,
+                    detail=redact_secrets(f"OpenAI API error: {res.text}"),
                 )
             data = res.json()
             text_out = data["choices"][0]["message"]["content"]
@@ -1226,7 +1329,13 @@ async def analyze_with_gpt(req: AnalyzeRequest, image_bytes: Optional[bytes]) ->
                 json={
                     "model": model_name,
                     "instructions": NUTRITION_SYSTEM_PROMPT,
-                    "input": [{"role": "user", "content": responses_content}],
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": responses_content,
+                        }
+                    ],
                     "text": {"format": {"type": "json_object"}},
                 },
             )
@@ -1242,7 +1351,7 @@ async def analyze_with_gpt(req: AnalyzeRequest, image_bytes: Optional[bytes]) ->
             if res.status_code >= 400:
                 raise HTTPException(
                     status_code=res.status_code,
-                    detail=f"OpenAI Responses API error: {res.text}",
+                    detail=redact_secrets(f"OpenAI Responses API error: {res.text}"),
                 )
             data = res.json()
             text_out = extract_openai_responses_text(data)
@@ -1289,14 +1398,17 @@ async def analyze_meal(
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "127.0.0.1")
     port = get_server_port()
     lan_ips = get_lan_ips()
     print("\n====================================================")
     print("  CalorieLens Companion Backend (Antigravity + SSO)")
-    print(f"  Local URL:   http://localhost:{port}")
+    print(f"  Local URL:   http://localhost:{port} (bound to {host})")
     print(f"  OAuth Loop:  http://127.0.0.1:{port}/api/oauth/openai/callback")
-    for ip in lan_ips:
-        print(f"  iPhone LAN:  http://{ip}:{port}")
+    if host == "0.0.0.0":
+        for ip in lan_ips:
+            print(f"  iPhone LAN:  http://{ip}:{port}")
+    else:
+        print("  LAN Access:  Disabled by default (set HOST=0.0.0.0 + COMPANION_AUTH_TOKEN to enable)")
     print("====================================================\n")
     uvicorn.run(app, host=host, port=port)

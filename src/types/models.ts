@@ -158,3 +158,34 @@ export interface CompanionStatusResponse {
   };
   message: string;
 }
+
+export type AILogLevel = 'info' | 'ok' | 'warn' | 'error';
+
+export interface AIDiagnosticLogEntry {
+  id: string;
+  timestamp: string;
+  level: AILogLevel;
+  scope: string;
+  message: string;
+  detail?: string;
+}
+
+export interface AIConnectionTestResult {
+  ok: boolean;
+  provider: AIProviderId;
+  authMethod: string;
+  modelUsed?: string;
+  endpoint?: string;
+  httpStatus?: number;
+  latencyMs: number;
+  replyText?: string;
+  errorMessage?: string;
+  timestamp: string;
+}
+
+export interface AIErrorReport {
+  title: string;
+  message: string;
+  provider: AIProviderId;
+  timestamp: string;
+}

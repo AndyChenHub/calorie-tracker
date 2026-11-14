@@ -128,10 +128,10 @@ class ExpoLoopbackOAuthModule : Module() {
         val reader = BufferedReader(InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))
         val firstLine = reader.readLine() ?: return@use
         val parts = firstLine.split(" ")
-        if (parts.size < 2) return@use
+        if (parts.size < 2 || parts[0].uppercase() != "GET") return@use
         val target = parts[1]
         if (target.startsWith("/favicon.ico")) {
-          val resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+          val resp = "HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
           c.getOutputStream().write(resp.toByteArray(StandardCharsets.UTF_8))
           c.getOutputStream().flush()
           return@use
@@ -143,10 +143,18 @@ class ExpoLoopbackOAuthModule : Module() {
           target.contains("error=")
         if (!isCallback) return@use
 
-        val html = "<!DOCTYPE html><html><body style=\"font-family:sans-serif;text-align:center;padding:40px;background:#F5F5F7;\"><h2>Connected to Plate</h2><p>Returning to Plate...</p></body></html>"
+        val html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/></head><body style=\"font-family:sans-serif;text-align:center;padding:40px;background:#F5F5F7;\"><h2>Connected to Plate</h2><p>Returning to Plate...</p><script>try{history.replaceState(null,'','/auth/callback');}catch(e){}</script></body></html>"
         val bodyBytes = html.toByteArray(StandardCharsets.UTF_8)
         val header =
-          "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: ${bodyBytes.size}\r\n\r\n"
+          "HTTP/1.1 200 OK\r\n" +
+          "Content-Type: text/html; charset=utf-8\r\n" +
+          "Cache-Control: no-store, no-cache, must-revalidate\r\n" +
+          "Referrer-Policy: no-referrer\r\n" +
+          "X-Content-Type-Options: nosniff\r\n" +
+          "X-Frame-Options: DENY\r\n" +
+          "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\r\n" +
+          "Connection: close\r\n" +
+          "Content-Length: ${bodyBytes.size}\r\n\r\n"
         c.getOutputStream().write(header.toByteArray(StandardCharsets.UTF_8))
         c.getOutputStream().write(bodyBytes)
         c.getOutputStream().flush()

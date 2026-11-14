@@ -243,7 +243,7 @@ private final class LoopbackOAuthServer {
     let requestText = String(decoding: buffer.prefix(bytesRead), as: UTF8.self)
     let firstLine = requestText.components(separatedBy: "\r\n").first ?? ""
     let parts = firstLine.split(separator: " ")
-    guard parts.count >= 2 else {
+    guard parts.count >= 2, String(parts[0]).uppercased() == "GET" else {
       sendRawResponse(
         clientFd: clientFd,
         statusLine: "HTTP/1.1 204 No Content",
@@ -333,6 +333,10 @@ private final class LoopbackOAuthServer {
       "\(statusLine)\r\n" +
       "Content-Type: \(contentType)\r\n" +
       "Cache-Control: no-store, no-cache, must-revalidate\r\n" +
+      "Referrer-Policy: no-referrer\r\n" +
+      "X-Content-Type-Options: nosniff\r\n" +
+      "X-Frame-Options: DENY\r\n" +
+      "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\r\n" +
       "Connection: close\r\n" +
       "Content-Length: \(bodyBytes.count)\r\n\r\n"
     let allBytes = Array(header.utf8) + bodyBytes
@@ -505,6 +509,9 @@ private final class LoopbackOAuthServer {
         <p>\(subtitle)</p>
         <a class="btn" href="calorietracker://">Return to Plate</a>
       </div>
+      <script>
+        try { history.replaceState(null, "", "/auth/callback"); } catch (e) {}
+      </script>
     </body>
     </html>
     """

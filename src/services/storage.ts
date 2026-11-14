@@ -1,4 +1,5 @@
 import Constants from 'expo-constants';
+import * as Crypto from 'expo-crypto';
 import { Directory, File, Paths } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 import * as SQLite from 'expo-sqlite';
@@ -9,6 +10,7 @@ import {
   DEFAULT_USER_PROFILE,
 } from '../constants/plateCatalog';
 import {
+  AIDiagnosticLogEntry,
   AppPreferences,
   ChatGPTOnDeviceSession,
   DailySummary,
@@ -67,10 +69,16 @@ const SECURE_KEYS = {
   geminiApiKey: 'cl_gemini_api_key',
   chatgptAccessToken: 'cl_oai_oauth_access',
   chatgptRefreshToken: 'cl_oai_oauth_refresh',
+  pendingPkce: 'cl_pending_chatgpt_pkce',
   settingsMirror: 'cl_settings_mirror_v1',
 } as const;
 
+const SECURE_STORE_OPTS: SecureStore.SecureStoreOptions = {
+  keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+};
+
 const SETTINGS_MIRROR_FILENAME = 'plate-settings-mirror.json';
+const EPHEMERAL_KEY_FILENAME = 'plate-ephemeral.key';
 
 const MIRRORED_SETTING_KEYS = [
   'user_goals',
@@ -326,11 +334,25 @@ async function loadSettingsMirrorMap(): Promise<Record<string, string>> {
           keychainMap = {};
         }
       }
-      // Document file preserves full history on in-place updates;
+      // Strip any legacy fallback secret entries from the document mirror file
+      let scrubbedLegacySecrets = false;
+      const cleanDocMap: Record<string, string> = {};
+      for (const [k, v] of Object.entries(docMap)) {
+        if (k.startsWith('sec_fb_') || k === 'pending_chatgpt_pkce') {
+          scrubbedLegacySecrets = true;
+        } else {
+          cleanDocMap[k] = v;
+        }
+      }
+      if (scrubbedLegacySecrets) {
+        await writeDocumentMirrorFile(cleanDocMap);
+      }
+
+      // Document file preserves full non-secret history on in-place updates;
       // iOS Keychain survives even uninstall + reinstall under the same bundle ID.
       const merged: Record<string, string> = {
         ...keychainMap,
-        ...docMap,
+        ...cleanDocMap,
       };
       mirrorCache = merged;
       return merged;
@@ -470,8 +492,32 @@ export async function upsertMeal(meal: MealEntry): Promise<void> {
   );
 }
 
+function deleteLocalMealPhotoFile(rawUri: string | null | undefined): void {
+  if (!rawUri || Platform.OS === 'web') return;
+  const marker = '/meal-photos/';
+  const idx = rawUri.lastIndexOf(marker);
+  if (idx < 0) return;
+  const fileName = rawUri.slice(idx + marker.length).split('?')[0];
+  if (!fileName || fileName.includes('/') || fileName.includes('..')) return;
+  try {
+    const file = new File(new Directory(Paths.document, 'meal-photos'), fileName);
+    if (file.exists) {
+      file.delete();
+    }
+  } catch {
+    // non-fatal file cleanup failure
+  }
+}
+
 export async function replaceAllMeals(meals: MealEntry[]): Promise<void> {
   const db = await getDb();
+  const prevRows = await db.getAllAsync<{ photo_uri: string | null }>(
+    'SELECT photo_uri FROM meals WHERE photo_uri IS NOT NULL'
+  );
+  const retainedPhotos = new Set(
+    meals.map((m) => m.photoUri).filter((u): u is string => Boolean(u))
+  );
+
   await db.withTransactionAsync(async () => {
     await db.runAsync('DELETE FROM meals');
     for (const meal of meals) {
@@ -500,11 +546,30 @@ export async function replaceAllMeals(meals: MealEntry[]): Promise<void> {
       );
     }
   });
+
+  for (const row of prevRows) {
+    if (row.photo_uri && !retainedPhotos.has(row.photo_uri)) {
+      deleteLocalMealPhotoFile(row.photo_uri);
+    }
+  }
 }
 
 export async function deleteMealById(id: string): Promise<void> {
   const db = await getDb();
+  const target = await db.getFirstAsync<{ photo_uri: string | null }>(
+    'SELECT photo_uri FROM meals WHERE id = ?',
+    [id]
+  );
   await db.runAsync('DELETE FROM meals WHERE id = ?', [id]);
+  if (target?.photo_uri) {
+    const stillUsed = await db.getFirstAsync<{ cnt: number }>(
+      'SELECT COUNT(*) as cnt FROM meals WHERE photo_uri = ?',
+      [target.photo_uri]
+    );
+    if (!stillUsed || stillUsed.cnt === 0) {
+      deleteLocalMealPhotoFile(target.photo_uri);
+    }
+  }
 }
 
 export function computeDailySummaries(
@@ -642,6 +707,98 @@ function isMirrorKey(key: string): boolean {
   return key.startsWith(SECURE_KEYS.settingsMirror);
 }
 
+function bytesToHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    hex += (bytes[i] ?? 0).toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.trim();
+  const out = new Uint8Array(Math.floor(clean.length / 2));
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
+  }
+  return out;
+}
+
+let cachedCipherKeyHex: string | null = null;
+
+async function getSideloadCipherKeyHex(): Promise<string> {
+  if (cachedCipherKeyHex) return cachedCipherKeyHex;
+  if (Platform.OS === 'web') {
+    cachedCipherKeyHex = bytesToHex(await Crypto.getRandomBytesAsync(32));
+    return cachedCipherKeyHex;
+  }
+  try {
+    // Stored in Paths.cache (Library/Caches), which iOS/Android exclude from cloud backups
+    const keyFile = new File(Paths.cache, EPHEMERAL_KEY_FILENAME);
+    if (keyFile.exists) {
+      const existing = (await keyFile.text()).trim();
+      if (/^[0-9a-f]{64}$/i.test(existing)) {
+        cachedCipherKeyHex = existing;
+        return existing;
+      }
+    }
+    const freshHex = bytesToHex(await Crypto.getRandomBytesAsync(32));
+    keyFile.create({ intermediates: true, overwrite: true });
+    await keyFile.write(freshHex);
+    cachedCipherKeyHex = freshHex;
+    return freshHex;
+  } catch {
+    cachedCipherKeyHex = bytesToHex(await Crypto.getRandomBytesAsync(32));
+    return cachedCipherKeyHex;
+  }
+}
+
+async function xorCtrTransform(
+  inputBytes: Uint8Array,
+  keyHex: string,
+  ivHex: string
+): Promise<Uint8Array> {
+  const output = new Uint8Array(inputBytes.length);
+  for (let offset = 0, block = 0; offset < inputBytes.length; offset += 32, block += 1) {
+    const streamHex = await Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      `${keyHex}:${ivHex}:${block}`,
+      { encoding: Crypto.CryptoEncoding.HEX }
+    );
+    const keystream = hexToBytes(streamHex);
+    const sliceEnd = Math.min(inputBytes.length, offset + 32);
+    for (let i = offset; i < sliceEnd; i += 1) {
+      output[i] = (inputBytes[i] ?? 0) ^ (keystream[i - offset] ?? 0);
+    }
+  }
+  return output;
+}
+
+async function encryptFallbackSecret(plainText: string): Promise<string> {
+  const keyHex = await getSideloadCipherKeyHex();
+  const ivHex = bytesToHex(await Crypto.getRandomBytesAsync(16));
+  const plainBytes = new TextEncoder().encode(plainText);
+  const cipherBytes = await xorCtrTransform(plainBytes, keyHex, ivHex);
+  return `enc1:${ivHex}:${bytesToHex(cipherBytes)}`;
+}
+
+async function decryptFallbackSecret(stored: string): Promise<string> {
+  if (!stored) return '';
+  if (!stored.startsWith('enc1:')) {
+    // Legacy plaintext fallback from pre-v1.1.5
+    return stored;
+  }
+  const parts = stored.split(':');
+  if (parts.length !== 3) return '';
+  const ivHex = parts[1] || '';
+  const cipherHex = parts[2] || '';
+  if (!ivHex || !cipherHex) return '';
+  const keyHex = await getSideloadCipherKeyHex();
+  const cipherBytes = hexToBytes(cipherHex);
+  const plainBytes = await xorCtrTransform(cipherBytes, keyHex, ivHex);
+  return new TextDecoder('utf-8').decode(plainBytes);
+}
+
 async function getFallbackSecret(key: string): Promise<string> {
   if (isMirrorKey(key)) return '';
   try {
@@ -650,16 +807,13 @@ async function getFallbackSecret(key: string): Promise<string> {
       'SELECT value FROM app_settings WHERE key = ?',
       [`sec_fb_${key}`]
     );
-    if (row?.value) return row.value;
+    if (row?.value) {
+      return await decryptFallbackSecret(row.value);
+    }
   } catch {
     // ignore sqlite fallback read error
   }
-  try {
-    const docMap = await readDocumentMirrorFile();
-    return docMap[`sec_fb_${key}`] || '';
-  } catch {
-    return '';
-  }
+  return '';
 }
 
 async function setFallbackSecret(key: string, value: string): Promise<void> {
@@ -670,56 +824,67 @@ async function setFallbackSecret(key: string, value: string): Promise<void> {
     if (!value) {
       await db.runAsync('DELETE FROM app_settings WHERE key = ?', [fbKey]);
     } else {
+      const encrypted = await encryptFallbackSecret(value);
       await db.runAsync(
         'INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)',
-        [fbKey, value]
+        [fbKey, encrypted]
       );
     }
   } catch {
     // ignore sqlite fallback write error
   }
-  try {
-    const docMap = await readDocumentMirrorFile();
-    if (!value) {
-      if (fbKey in docMap) {
-        delete docMap[fbKey];
-        await writeDocumentMirrorFile(docMap);
-      }
-    } else if (docMap[fbKey] !== value) {
-      docMap[fbKey] = value;
-      await writeDocumentMirrorFile(docMap);
-    }
-  } catch {
-    // ignore document mirror fallback error
-  }
 }
 
 async function getSecret(key: string): Promise<string> {
   try {
-    const val = await SecureStore.getItemAsync(key);
-    if (val) return val;
+    const val = await SecureStore.getItemAsync(key, SECURE_STORE_OPTS);
+    if (val) {
+      // Ensure no legacy fallback residue remains once Keychain has the secret
+      if (!isMirrorKey(key)) {
+        void setFallbackSecret(key, '');
+      }
+      return val;
+    }
   } catch {
-    // fall through to sandbox fallback (e.g. unsigned/sideloaded IPA keychain entitlement restrictions)
+    // fall through to encrypted sideload fallback (unsigned IPA without Keychain entitlement)
   }
-  return getFallbackSecret(key);
+
+  const fbVal = await getFallbackSecret(key);
+  if (fbVal && !isMirrorKey(key)) {
+    // Attempt opportunistic upgrade into hardware-backed Keychain + wipe fallback
+    try {
+      await SecureStore.setItemAsync(key, fbVal, SECURE_STORE_OPTS);
+      const readBack = await SecureStore.getItemAsync(key, SECURE_STORE_OPTS);
+      if (readBack === fbVal) {
+        await setFallbackSecret(key, '');
+      }
+    } catch {
+      // Keychain unavailable on unsigned sideloaded build; keep encrypted fallback
+    }
+  }
+  return fbVal;
 }
 
 async function setSecret(key: string, value: string): Promise<void> {
   let storedInKeychain = false;
   try {
     if (!value) {
-      await SecureStore.deleteItemAsync(key);
+      await SecureStore.deleteItemAsync(key, SECURE_STORE_OPTS);
       storedInKeychain = true;
     } else {
-      await SecureStore.setItemAsync(key, value);
-      const readBack = await SecureStore.getItemAsync(key);
+      await SecureStore.setItemAsync(key, value, SECURE_STORE_OPTS);
+      const readBack = await SecureStore.getItemAsync(key, SECURE_STORE_OPTS);
       storedInKeychain = readBack === value;
     }
   } catch {
     storedInKeychain = false;
   }
 
-  if (!value || !storedInKeychain || Platform.OS !== 'web') {
+  if (!value || storedInKeychain) {
+    // Keychain succeeded (or secret was cleared) -> purge any SQLite fallback copy
+    await setFallbackSecret(key, '');
+  } else {
+    // Unsigned sideloaded build without Keychain entitlement -> store encrypted fallback only
     await setFallbackSecret(key, value);
   }
 }
@@ -869,7 +1034,22 @@ export async function saveAuthConfig(config: ProviderAuthConfig): Promise<void> 
 }
 
 export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow | null> {
-  const raw = await getSettingValue('pending_chatgpt_pkce');
+  let raw = await getSecret(SECURE_KEYS.pendingPkce);
+  if (!raw) {
+    // One-time migration/scrub of any legacy SQLite row
+    const legacy = await getSettingValue('pending_chatgpt_pkce');
+    if (legacy) {
+      raw = legacy;
+      try {
+        const db = await getDb();
+        await db.runAsync('DELETE FROM app_settings WHERE key = ?', [
+          'pending_chatgpt_pkce',
+        ]);
+      } catch {
+        // ignore cleanup race
+      }
+    }
+  }
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as PendingChatGPTPkceFlow;
@@ -878,6 +1058,7 @@ export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow |
       !parsed?.codeVerifier ||
       Date.now() - (parsed.createdAt || 0) > 20 * 60 * 1000
     ) {
+      await setSecret(SECURE_KEYS.pendingPkce, '');
       return null;
     }
     return parsed;
@@ -889,10 +1070,37 @@ export async function loadPendingChatGPTPkce(): Promise<PendingChatGPTPkceFlow |
 export async function savePendingChatGPTPkce(
   flow: PendingChatGPTPkceFlow | null
 ): Promise<void> {
-  await setSettingValue(
-    'pending_chatgpt_pkce',
-    flow ? JSON.stringify(flow) : ''
-  );
+  await setSecret(SECURE_KEYS.pendingPkce, flow ? JSON.stringify(flow) : '');
+  try {
+    const db = await getDb();
+    await db.runAsync('DELETE FROM app_settings WHERE key = ?', [
+      'pending_chatgpt_pkce',
+    ]);
+  } catch {
+    // ignore cleanup race
+  }
+}
+
+export async function loadAIDiagnosticLogs(): Promise<AIDiagnosticLogEntry[]> {
+  try {
+    const raw = await getSettingValue('ai_diagnostic_logs_v1');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as AIDiagnosticLogEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveAIDiagnosticLogs(
+  logs: AIDiagnosticLogEntry[]
+): Promise<void> {
+  try {
+    const trimmed = logs.slice(-60);
+    await setSettingValue('ai_diagnostic_logs_v1', JSON.stringify(trimmed));
+  } catch {
+    // non-fatal diagnostic persistence failure
+  }
 }
 
 export async function loadOnboardingCompleted(): Promise<boolean> {
@@ -941,6 +1149,21 @@ export async function hasStoredUserConfiguration(): Promise<boolean> {
   );
 }
 
+function sanitizeBackupCompanionUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return inferDefaultCompanionUrl();
+  try {
+    const parsed = new URL(trimmed);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/+$/, '');
+  } catch {
+    return inferDefaultCompanionUrl();
+  }
+}
+
 export async function createPortableBackupJson(): Promise<string> {
   const [goals, profile, preferences, auth, waterByDate, stepsByDate, meals] =
     await Promise.all([
@@ -953,6 +1176,13 @@ export async function createPortableBackupJson(): Promise<string> {
       loadAllMeals(),
     ]);
 
+  // Strip local sandbox file:// paths from portable backup JSON so device container UUIDs do not leak
+  const portableMeals: MealEntry[] = meals.map((m) => ({
+    ...m,
+    photoUri:
+      m.photoUri && m.photoUri.startsWith('file://') ? null : m.photoUri,
+  }));
+
   const payload: PlatePortableBackup = {
     schema: 'plate-backup-v1',
     exportedAt: new Date().toISOString(),
@@ -961,14 +1191,14 @@ export async function createPortableBackupJson(): Promise<string> {
     preferences,
     authPreferences: {
       activeProvider: auth.activeProvider,
-      companionUrl: auth.companionUrl,
+      companionUrl: sanitizeBackupCompanionUrl(auth.companionUrl),
       claudeModel: auth.claudeModel,
       gptModel: auth.gptModel,
       geminiModel: auth.geminiModel,
     },
     waterByDate,
     stepsByDate,
-    meals,
+    meals: portableMeals,
   };
 
   return JSON.stringify(payload, null, 2);

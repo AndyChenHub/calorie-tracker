@@ -4,6 +4,7 @@ import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Keyboard,
   Modal,
   Platform,
   Pressable,
@@ -25,20 +26,30 @@ import { getAppVersionMetadata } from '../constants/version';
 import { useCalorieTracker } from '../context/CalorieContext';
 import {
   cancelPendingChatGPTSignIn,
+  clearAIDiagnosticLogs,
   completeOnDeviceChatGPTCallback,
   detectApiKeyProvider,
   disconnectChatGPTOAuth,
   disconnectGoogleOAuth,
+  formatAIDiagnosticLogsText,
+  getAIDiagnosticLogs,
   isProviderConfigured,
   looksLikeOAuthCallbackInput,
   openProviderPortalForKey,
   signInWithGoogleOAuth,
   startChatGPTDeviceCodeSignIn,
   startChatGPTSignIn,
-  testAIProviderConnection,
+  subscribeAIDiagnosticLogs,
+  verifyAIConnection,
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
-import { AIProviderId, UserGoals } from '../types/models';
+import {
+  AIConnectionTestResult,
+  AIDiagnosticLogEntry,
+  AIProviderId,
+  UserGoals,
+} from '../types/models';
+import { useKeyboardState } from '../utils/useKeyboardState';
 import { useIsDesktopStage } from './PhoneStageFrame';
 import { PlateIcon } from './PlatePrimitives';
 
@@ -63,9 +74,13 @@ export function PlateSettingsView({
     clearAllLogs,
     exportBackupJson,
     showToast,
+    aiLogsExpandSignal,
   } = useCalorieTracker();
 
   const isDesktopStage = useIsDesktopStage();
+  const keyboard = useKeyboardState();
+  const scrollRef = useRef<React.ComponentRef<typeof ScrollView> | null>(null);
+  const aiSectionYRef = useRef<number>(0);
   const [oauthBusy, setOauthBusy] = useState(false);
   const [awaitingGptCallback, setAwaitingGptCallback] = useState(false);
   const [callbackUrlDraft, setCallbackUrlDraft] = useState('');
@@ -80,18 +95,42 @@ export function PlateSettingsView({
     null
   );
   const [testingAi, setTestingAi] = useState(false);
+  const [testResult, setTestResult] = useState<AIConnectionTestResult | null>(
+    null
+  );
+  const [aiLogs, setAiLogs] = useState<AIDiagnosticLogEntry[]>(() =>
+    getAIDiagnosticLogs()
+  );
+  const [logsOpen, setLogsOpen] = useState<boolean>(
+    () => aiLogsExpandSignal > 0
+  );
   const [clearTapCount, setClearTapCount] = useState(0);
   const [clearedPopupOpen, setClearedPopupOpen] = useState(false);
   const clearTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    const unsub = subscribeAIDiagnosticLogs(setAiLogs);
     return () => {
+      unsub();
       deviceCodeAbortRef.current?.abort();
       if (clearTapTimerRef.current) {
         clearTimeout(clearTapTimerRef.current);
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (aiLogsExpandSignal > 0) {
+      const timer = setTimeout(() => {
+        setLogsOpen(true);
+        scrollRef.current?.scrollTo({
+          y: Math.max(0, aiSectionYRef.current - 12),
+          animated: true,
+        });
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [aiLogsExpandSignal]);
 
   const handleClearMealsPress = async () => {
     if (clearTapTimerRef.current) {
@@ -217,14 +256,35 @@ export function PlateSettingsView({
   };
 
   const handleTestAi = async () => {
+    Keyboard.dismiss();
     setTestingAi(true);
+    setTestResult(null);
     try {
-      const res = await testAIProviderConnection(auth, activeProvider);
-      showToast(
-        `✓ AI ready (${res.modelUsed || colors.providers[res.providerUsed].label})`
+      const res = await verifyAIConnection(
+        auth,
+        activeProvider,
+        companionStatus
       );
+      setTestResult(res);
+      if (res.ok) {
+        showToast(`✓ AI responded (${res.latencyMs} ms)`);
+      } else {
+        setLogsOpen(true);
+        showToast('AI test failed — see error details below', 'error');
+      }
     } catch (err) {
-      showToast(err instanceof Error ? err.message : 'AI connection failed');
+      const msg =
+        err instanceof Error ? err.message : 'AI connection test failed';
+      setTestResult({
+        ok: false,
+        provider: activeProvider,
+        authMethod: providerStatus.methodLabel || 'Not connected',
+        latencyMs: 0,
+        errorMessage: msg,
+        timestamp: new Date().toISOString(),
+      });
+      setLogsOpen(true);
+      showToast('AI test failed — see error details below', 'error');
     } finally {
       setTestingAi(false);
     }
@@ -434,15 +494,17 @@ export function PlateSettingsView({
   };
 
   return (
-    <ScrollView
-      style={styles.screen}
-      contentContainerStyle={[
-        styles.content,
-        { paddingTop: isDesktopStage ? 58 : 10 },
-      ]}
-      showsVerticalScrollIndicator={false}
-      keyboardShouldPersistTaps="handled"
-    >
+    <View style={styles.screen}>
+      <ScrollView
+        ref={scrollRef}
+        style={styles.screen}
+        contentContainerStyle={[
+          styles.content,
+          { paddingTop: isDesktopStage ? 58 : 10 },
+        ]}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      >
       <Text style={styles.pageTitle}>Settings</Text>
 
       {/* Profile Card */}
@@ -541,7 +603,12 @@ export function PlateSettingsView({
       </View>
 
       {/* AI Vision & Official Website SSO */}
-      <View style={styles.aiGroupHead}>
+      <View
+        onLayout={(e) => {
+          aiSectionYRef.current = e.nativeEvent.layout.y;
+        }}
+        style={styles.aiGroupHead}
+      >
         <Text style={styles.groupLabel}>AI Vision & Official SSO</Text>
         <View style={styles.statusChip}>
           <View
@@ -863,19 +930,150 @@ export function PlateSettingsView({
           </View>
         ) : null}
 
-        {providerStatus.ready ? (
-          <Pressable
-            onPress={handleTestAi}
-            disabled={testingAi}
-            style={[styles.secondaryAuthBtn, { marginTop: 10 }]}
+        <Pressable
+          onPress={() => void handleTestAi()}
+          disabled={testingAi}
+          style={({ pressed }) => [
+            styles.verifyAiBtn,
+            pressed && !testingAi ? { transform: [{ scale: 0.99 }] } : null,
+          ]}
+        >
+          {testingAi ? (
+            <ActivityIndicator size="small" color={plateColors.ink} />
+          ) : (
+            <PlateIcon name="sparkle" size={15} color={plateColors.ink} />
+          )}
+          <Text style={styles.verifyAiBtnText}>
+            {testingAi
+              ? 'Sending test message to AI…'
+              : 'Verify AI connection (Send test message)'}
+          </Text>
+        </Pressable>
+
+        {testResult ? (
+          <View
+            style={[
+              styles.testResultCard,
+              testResult.ok
+                ? styles.testResultCardOk
+                : styles.testResultCardErr,
+            ]}
           >
-            {testingAi ? (
-              <ActivityIndicator size="small" color={plateColors.ink} />
-            ) : null}
-            <Text style={styles.secondaryAuthBtnText}>
-              {testingAi ? 'Testing AI connection…' : 'Verify AI connection'}
+            <View style={styles.testResultHeader}>
+              <View style={styles.testResultBadgeRow}>
+                <View
+                  style={[
+                    styles.testResultIconCircle,
+                    {
+                      backgroundColor: testResult.ok
+                        ? plateColors.ok
+                        : plateColors.danger,
+                    },
+                  ]}
+                >
+                  <PlateIcon
+                    name={testResult.ok ? 'check' : 'x'}
+                    size={12}
+                    color="#FFFFFF"
+                  />
+                </View>
+                <Text
+                  style={[
+                    styles.testResultTitle,
+                    {
+                      color: testResult.ok ? '#157A42' : '#B4232C',
+                    },
+                  ]}
+                >
+                  {testResult.ok
+                    ? `AI Connected · ${testResult.latencyMs} ms`
+                    : `Connection Failed${
+                        testResult.httpStatus
+                          ? ` (HTTP ${testResult.httpStatus})`
+                          : ''
+                      }`}
+                </Text>
+              </View>
+
+              <Pressable
+                onPress={() => setTestResult(null)}
+                hitSlop={8}
+                style={styles.testDismissBtn}
+              >
+                <PlateIcon name="x" size={13} color={plateColors.muted} />
+              </Pressable>
+            </View>
+
+            <Text style={styles.testResultMeta}>
+              {[
+                colors.providers[testResult.provider].label,
+                testResult.authMethod,
+                testResult.modelUsed,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             </Text>
-          </Pressable>
+
+            {testResult.ok ? (
+              <View style={styles.testReplyBox}>
+                <Text style={styles.testReplyLabel}>AI test reply:</Text>
+                <Text selectable style={styles.testReplyText}>
+                  {`"${testResult.replyText || 'Plate AI connection is working.'}"`}
+                </Text>
+              </View>
+            ) : (
+              <>
+                {testResult.endpoint ? (
+                  <Text selectable style={styles.testEndpointText}>
+                    {`Endpoint: ${testResult.endpoint}`}
+                  </Text>
+                ) : null}
+                <View style={styles.testErrorBox}>
+                  <Text selectable style={styles.testErrorText}>
+                    {testResult.errorMessage || 'Unknown error'}
+                  </Text>
+                </View>
+                <View style={styles.testErrorActions}>
+                  <Pressable
+                    onPress={async () => {
+                      const summary = [
+                        `Provider: ${colors.providers[testResult.provider].label}`,
+                        testResult.authMethod
+                          ? `Auth: ${testResult.authMethod}`
+                          : '',
+                        testResult.modelUsed
+                          ? `Model: ${testResult.modelUsed}`
+                          : '',
+                        testResult.httpStatus
+                          ? `HTTP Status: ${testResult.httpStatus}`
+                          : '',
+                        testResult.endpoint
+                          ? `Endpoint: ${testResult.endpoint}`
+                          : '',
+                        `Error: ${testResult.errorMessage || 'Unknown error'}`,
+                      ]
+                        .filter(Boolean)
+                        .join('\n');
+                      await Clipboard.setStringAsync(summary);
+                      showToast('Error copied to clipboard');
+                    }}
+                    style={styles.logToolbarBtn}
+                  >
+                    <Text style={styles.logToolbarBtnText}>Copy Error</Text>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={() => setLogsOpen(true)}
+                    style={styles.logToolbarBtn}
+                  >
+                    <Text style={styles.logToolbarBtnText}>
+                      {logsOpen ? 'Logs Open Below' : 'View Full Logs'}
+                    </Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
+          </View>
         ) : null}
 
         <Pressable
@@ -917,6 +1115,117 @@ export function PlateSettingsView({
             >
               <Text style={styles.inlineBtnText}>Save</Text>
             </Pressable>
+          </View>
+        ) : null}
+
+        {/* AI Diagnostic Logs Accordion */}
+        <Pressable
+          onPress={() => setLogsOpen((v) => !v)}
+          style={styles.logsToggleRow}
+        >
+          <View style={styles.logsToggleLeft}>
+            <Text style={styles.logsToggleTitle}>
+              {`AI Diagnostic Logs (${aiLogs.length})`}
+            </Text>
+            {aiLogs.some((l) => l.level === 'error') ? (
+              <View style={styles.logsErrDot} />
+            ) : null}
+          </View>
+          <Text style={styles.companionEditLink}>
+            {logsOpen ? 'Hide' : 'Show'}
+          </Text>
+        </Pressable>
+
+        {logsOpen ? (
+          <View style={styles.logsPanel}>
+            <View style={styles.logsToolbar}>
+              <Text style={styles.logsHintText}>
+                Newest first · tokens auto-redacted
+              </Text>
+              <View style={{ flexDirection: 'row', gap: 6 }}>
+                <Pressable
+                  onPress={async () => {
+                    await Clipboard.setStringAsync(
+                      formatAIDiagnosticLogsText()
+                    );
+                    showToast('AI diagnostic logs copied');
+                  }}
+                  style={styles.logToolbarBtn}
+                >
+                  <Text style={styles.logToolbarBtnText}>Copy Logs</Text>
+                </Pressable>
+                {aiLogs.length > 0 ? (
+                  <Pressable
+                    onPress={async () => {
+                      await clearAIDiagnosticLogs();
+                      showToast('AI logs cleared');
+                    }}
+                    style={styles.logToolbarBtn}
+                  >
+                    <Text
+                      style={[
+                        styles.logToolbarBtnText,
+                        { color: plateColors.danger },
+                      ]}
+                    >
+                      Clear
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            </View>
+
+            {aiLogs.length === 0 ? (
+              <Text style={styles.logsEmptyText}>
+                No AI requests logged yet. Tap &ldquo;Verify AI connection&rdquo;
+                above or scan a meal to record request &amp; error details.
+              </Text>
+            ) : (
+              <ScrollView
+                style={styles.logsScrollBox}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator
+              >
+                {[...aiLogs].reverse().map((entry) => {
+                  const timeStr = new Date(entry.timestamp).toLocaleTimeString(
+                    [],
+                    {
+                      hour12: false,
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    }
+                  );
+                  const levelColor =
+                    entry.level === 'error'
+                      ? '#FF6B6B'
+                      : entry.level === 'warn'
+                        ? '#F5B041'
+                        : entry.level === 'ok'
+                          ? '#4CD97B'
+                          : '#8EB8FF';
+                  return (
+                    <View key={entry.id} style={styles.logItem}>
+                      <Text selectable style={styles.logItemHead}>
+                        <Text style={{ color: '#8E8E98' }}>{`[${timeStr}] `}</Text>
+                        <Text style={{ color: levelColor, fontWeight: '700' }}>
+                          {`${entry.level.toUpperCase()} `}
+                        </Text>
+                        <Text style={{ color: '#C8C8D2' }}>
+                          {`[${entry.scope}] `}
+                        </Text>
+                        {entry.message}
+                      </Text>
+                      {entry.detail ? (
+                        <Text selectable style={styles.logItemDetail}>
+                          {entry.detail}
+                        </Text>
+                      ) : null}
+                    </View>
+                  );
+                })}
+              </ScrollView>
+            )}
           </View>
         ) : null}
       </View>
@@ -1020,7 +1329,21 @@ export function PlateSettingsView({
           </View>
         </View>
       </Modal>
-    </ScrollView>
+      </ScrollView>
+
+      {keyboard.visible ? (
+        <Pressable
+          onPress={() => Keyboard.dismiss()}
+          style={[
+            styles.floatingKeyboardDone,
+            { top: isDesktopStage ? 56 : 12 },
+          ]}
+        >
+          <PlateIcon name="check" size={14} color="#FFFFFF" />
+          <Text style={styles.floatingKeyboardDoneText}>Done</Text>
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
@@ -1221,6 +1544,8 @@ const styles = StyleSheet.create({
     height: 38,
     borderRadius: 12,
     backgroundColor: plateColors.chip,
+    flexDirection: 'row',
+    gap: 8,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 12,
@@ -1229,6 +1554,236 @@ const styles = StyleSheet.create({
     fontSize: 12.5,
     fontWeight: '600',
     color: plateColors.ink2,
+  },
+  verifyAiBtn: {
+    marginTop: 12,
+    height: 44,
+    borderRadius: 14,
+    backgroundColor: plateColors.chip,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 14,
+  },
+  verifyAiBtnText: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    color: plateColors.ink,
+  },
+  testResultCard: {
+    marginTop: 10,
+    borderRadius: 16,
+    padding: 12,
+    gap: 7,
+    borderWidth: 1,
+  },
+  testResultCardOk: {
+    backgroundColor: '#EEFBF3',
+    borderColor: 'rgba(30,158,90,0.28)',
+  },
+  testResultCardErr: {
+    backgroundColor: '#FFF2F3',
+    borderColor: 'rgba(229,72,77,0.32)',
+  },
+  testResultHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  testResultBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    flex: 1,
+  },
+  testResultIconCircle: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  testResultTitle: {
+    fontSize: 13.5,
+    fontWeight: '700',
+    flex: 1,
+  },
+  testDismissBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  testResultMeta: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.ink2,
+  },
+  testReplyBox: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 11,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(30,158,90,0.18)',
+    gap: 2,
+  },
+  testReplyLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: plateColors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  testReplyText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: plateColors.ink,
+    lineHeight: 18,
+  },
+  testEndpointText: {
+    fontSize: 11.5,
+    color: plateColors.muted,
+  },
+  testErrorBox: {
+    backgroundColor: '#18181D',
+    borderRadius: 11,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+  },
+  testErrorText: {
+    color: '#FFE2E5',
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+      default: 'monospace',
+    }),
+  },
+  testErrorActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 2,
+  },
+  logsToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: plateColors.line,
+  },
+  logsToggleLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  logsToggleTitle: {
+    fontSize: 12.5,
+    fontWeight: '600',
+    color: plateColors.ink2,
+  },
+  logsErrDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: plateColors.danger,
+  },
+  logsPanel: {
+    marginTop: 8,
+    gap: 8,
+  },
+  logsToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  logsHintText: {
+    fontSize: 11.5,
+    color: plateColors.muted,
+    flex: 1,
+  },
+  logToolbarBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 9,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  logToolbarBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.ink,
+  },
+  logsEmptyText: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: plateColors.muted,
+    paddingVertical: 8,
+  },
+  logsScrollBox: {
+    maxHeight: 260,
+    backgroundColor: '#141418',
+    borderRadius: 14,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+  },
+  logItem: {
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.1)',
+    gap: 3,
+  },
+  logItemHead: {
+    color: '#F2F2F7',
+    fontSize: 11.5,
+    lineHeight: 16,
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+      default: 'monospace',
+    }),
+  },
+  logItemDetail: {
+    color: '#B8B8C4',
+    fontSize: 11,
+    lineHeight: 15,
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+      default: 'monospace',
+    }),
+  },
+  floatingKeyboardDone: {
+    position: 'absolute',
+    right: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: plateColors.ink,
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: 99,
+    zIndex: 40,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.25,
+    shadowRadius: 12,
+    elevation: 6,
+  },
+  floatingKeyboardDoneText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
   },
   callbackBox: {
     backgroundColor: plateColors.bg,

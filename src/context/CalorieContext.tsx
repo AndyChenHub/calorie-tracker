@@ -15,8 +15,10 @@ import {
 import {
   analyzeMealWithAI,
   checkCompanionStatus,
+  ensureAIDiagnosticLogsLoaded,
   isProviderConfigured,
   resolveReadyProvider,
+  subscribeChatGPTSessionRefresh,
 } from '../services/ai';
 import { assetToBase64, persistMealPhotoUri } from '../services/photos';
 import {
@@ -51,6 +53,7 @@ import {
   upsertMeal,
 } from '../services/storage';
 import {
+  AIErrorReport,
   AppPreferences,
   CompanionStatusResponse,
   DailySummary,
@@ -63,6 +66,7 @@ import {
 import { inferMealTypeByHour, toLocalDateKey } from '../utils/date';
 
 export type PlateTabId = 'home' | 'progress' | 'settings';
+export type ToastTone = 'ok' | 'error';
 
 export interface StartMealAnalysisParams {
   photoUri?: string | null;
@@ -84,7 +88,12 @@ interface CalorieContextValue {
   detailEntryId: string | null;
   setDetailEntryId: (id: string | null) => void;
   toastMessage: string | null;
-  showToast: (msg: string) => void;
+  toastTone: ToastTone;
+  showToast: (msg: string, tone?: ToastTone) => void;
+  lastAIError: AIErrorReport | null;
+  clearLastAIError: () => void;
+  aiLogsExpandSignal: number;
+  openAILogsInSettings: () => void;
   selectedDateKey: string;
   setSelectedDateKey: (dateKey: string) => void;
   meals: MealEntry[];
@@ -141,6 +150,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
   const [scannerOpen, setScannerOpen] = useState(false);
   const [detailEntryId, setDetailEntryId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastTone, setToastTone] = useState<ToastTone>('ok');
+  const [lastAIError, setLastAIError] = useState<AIErrorReport | null>(null);
+  const [aiLogsExpandSignal, setAiLogsExpandSignal] = useState(0);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [selectedDateKey, setSelectedDateKey] = useState<string>(() =>
@@ -169,14 +181,30 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     useState<CompanionStatusResponse | null>(null);
   const [isCheckingCompanion, setIsCheckingCompanion] = useState(false);
 
-  const showToast = useCallback((msg: string) => {
+  const showToast = useCallback((msg: string, tone: ToastTone = 'ok') => {
+    setToastTone(tone);
     setToastMessage(msg);
     if (toastTimerRef.current) {
       clearTimeout(toastTimerRef.current);
     }
-    toastTimerRef.current = setTimeout(() => {
-      setToastMessage(null);
-    }, 2400);
+    toastTimerRef.current = setTimeout(
+      () => {
+        setToastMessage(null);
+      },
+      tone === 'error' ? 4200 : 2500
+    );
+  }, []);
+
+  const clearLastAIError = useCallback(() => {
+    setLastAIError(null);
+  }, []);
+
+  const openAILogsInSettings = useCallback(() => {
+    setLastAIError(null);
+    setDetailEntryId(null);
+    setScannerOpen(false);
+    setActiveTab('settings');
+    setAiLogsExpandSignal((n) => n + 1);
   }, []);
 
   const refreshCompanionStatus = useCallback(
@@ -298,6 +326,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
         // Back up pre-existing SQLite settings into Documents + iOS Keychain mirrors
         void ensureSettingsMirrored();
+        void ensureAIDiagnosticLogsLoaded();
 
         if (!mounted) return;
         profileRef.current = initialProfile;
@@ -327,8 +356,16 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       }
     })();
 
+    const unsubSessionRefresh = subscribeChatGPTSessionRefresh((nextSession) => {
+      if (!mounted) return;
+      const merged = { ...authRef.current, chatgptOAuth: nextSession };
+      authRef.current = merged;
+      setAuth(merged);
+    });
+
     return () => {
       mounted = false;
+      unsubSessionRefresh();
       if (toastTimerRef.current) {
         clearTimeout(toastTimerRef.current);
       }
@@ -602,7 +639,13 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         clearInterval(progressTimer);
         setMeals((prev) => prev.filter((m) => m.id !== entryId));
         const msg = err instanceof Error ? err.message : 'Analysis failed';
-        showToast(msg.length > 48 ? `${msg.slice(0, 48)}…` : msg);
+        setLastAIError({
+          title: 'AI Meal Scan Failed',
+          message: msg,
+          provider: effectiveProvider,
+          timestamp: new Date().toISOString(),
+        });
+        showToast('AI scan failed — see error details', 'error');
       }
     },
     [auth, companionStatus, selectedDateKey, showToast]
@@ -685,7 +728,13 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         return true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Update failed';
-        showToast(msg.length > 46 ? `${msg.slice(0, 46)}…` : msg);
+        setLastAIError({
+          title: 'AI Refinement Failed',
+          message: msg,
+          provider: effectiveProvider,
+          timestamp: new Date().toISOString(),
+        });
+        showToast('AI update failed — see error details', 'error');
         return false;
       }
     },
@@ -718,7 +767,12 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       detailEntryId,
       setDetailEntryId,
       toastMessage,
+      toastTone,
       showToast,
+      lastAIError,
+      clearLastAIError,
+      aiLogsExpandSignal,
+      openAILogsInSettings,
       selectedDateKey,
       setSelectedDateKey,
       meals,
@@ -759,7 +813,12 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       scannerOpen,
       detailEntryId,
       toastMessage,
+      toastTone,
       showToast,
+      lastAIError,
+      clearLastAIError,
+      aiLogsExpandSignal,
+      openAILogsInSettings,
       selectedDateKey,
       meals,
       mealsForSelectedDate,

@@ -5,6 +5,21 @@ All notable changes to **CalorieLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] - 2026-11-14 (Build 7)
+
+### Security
+- **Lossless EXIF / GPS / IPTC / PNG Metadata Stripping (`imagePrivacy.ts`)**: Added lossless binary sanitization across camera captures, photo library picks, and `analyzeMealWithAI` so GPS coordinates, device serial numbers, timestamps, and comments are stripped before any meal photo leaves the device.
+- **Hardware-Backed Secret Isolation & Sanitized Backups (`storage.ts`, `storage.web.ts`)**: Enforced `WHEN_UNLOCKED_THIS_DEVICE_ONLY` on `SecureStore`, eliminated plaintext SQLite/JSON secret mirroring when Keychain is available, encrypted sideload-only fallback secrets with an ephemeral `Library/Caches` key (excluded from cloud backups), moved pending PKCE verifiers into `SecureStore`, isolated Web credentials in `sessionStorage`, deleted orphan `meal-photos/` files on meal removal/clear, and stripped URL credentials and sandbox `file://` container UUID paths from portable backups.
+- **API Header Auth, HTTPS Enforcement & Loopback/Backend Hardening (`ai.ts`, `ExpoLoopbackOAuth`, `backend/server.py`)**: Migrated Google Gemini requests from `?key=` URL query strings to `x-goog-api-key` headers, blocked cleartext `http://` companion URLs on non-local networks, validated `postMessage` origins, added `Referrer-Policy: no-referrer` + `history.replaceState` code scrubbing on native loopback OAuth callbacks, restricted companion server CORS/binding (`127.0.0.1`, `0o600` OAuth state, `secrets.compare_digest`, masked status emails), and expanded credential/JWT/base64 redaction in diagnostic logs.
+
+### Added
+- **Live Metric Barcode Lookup (`barcode.ts`, `PlateOverlays.tsx`)**: Added privacy-preserving EAN/UPC barcode scanning (`credentials: 'omit'`, `referrerPolicy: 'no-referrer'`) with automatic live camera detection, manual digit lookup, metric `g`/`mL` portion normalization, offline staple fallbacks, and 1-tap **Add to Log**.
+
+### Fixed
+- **Keyboard-Aware Edit Profile Sheet & Auto-Save on Outside Tap**: Wrapped bottom sheets, Nutrition Detail, Scanner, and Initial Setup in `SafeArea`-offset `KeyboardAvoidingView` containers with scrollable `keyboardShouldPersistTaps="handled"` bodies and 1-tap **Done** keyboard-dismiss pills so numeric/decimal keypads never cover inputs or trap focus. Added **Current weight (`kg`)** directly inside **Edit profile** alongside **Goal weight (`kg`)**, **Starting weight (`kg`)**, **Height (`cm`)**, and **Name**, and auto-saved valid profile edits when tapping outside the popup (with an explicit **Cancel** button to discard).
+- **Post-Login ChatGPT / Codex Responses API Schema, Model Discovery & Rotating OAuth Sync**: Added required `"type": "message"` on `input` items and `"detail": "auto"` on `input_image` blocks for `chatgpt.com/backend-api/codex/responses` and `api.openai.com/v1/responses`, added `/backend-api/codex/models` capability discovery (`codex_cli_rs/0.99.0` headers) without aborting fallback on model-tier `403`, added automatic `401` force-refresh retry, and synchronized rotated single-use OAuth refresh tokens back into live React context (`subscribeChatGPTSessionRefresh`).
+- **Live Test-Message AI Verification & Full Diagnostic Logging**: Upgraded **Verify AI connection (Send test message)** in Settings and Initial Setup to send a real test message (`verifyAIConnection`) and display an inline result card with latency, model, auth mode, and the AI's actual reply (or full selectable HTTP/endpoint error + **Copy Error**). Added persistent redacted **AI Diagnostic Logs** (`ai_diagnostic_logs_v1`) in Settings and an untruncated **AI Error Details** modal whenever a meal scan or refinement fails.
+
 ## [1.1.4] - 2026-11-14 (Build 6)
 
 ### Changed

@@ -1,5 +1,6 @@
 import * as ImagePicker from 'expo-image-picker';
 import { ImageSourcePropType } from 'react-native';
+import { stripImageMetadataBase64 } from '../utils/imagePrivacy';
 
 export interface PickedMealPhoto {
   uri: string;
@@ -32,11 +33,14 @@ async function normalizeWebAsset(
   asset: ImagePicker.ImagePickerAsset
 ): Promise<PickedMealPhoto> {
   const mimeType = asset.mimeType || 'image/jpeg';
-  const base64 = asset.base64 || (await blobUriToBase64(asset.uri));
+  const rawBase64 = asset.base64 || (await blobUriToBase64(asset.uri));
+  const base64 = rawBase64 ? stripImageMetadataBase64(rawBase64) : '';
   const displayUri =
     base64 && !asset.uri.startsWith('data:')
       ? `data:${mimeType};base64,${base64}`
-      : asset.uri;
+      : base64
+        ? `data:${mimeType};base64,${base64}`
+        : asset.uri;
 
   return {
     uri: displayUri,
@@ -52,6 +56,7 @@ export async function capturePhotoFromCamera(): Promise<PickedMealPhoto | null> 
     mediaTypes: ['images'],
     quality: 0.72,
     base64: true,
+    exif: false,
   });
   if (result.canceled || !result.assets?.length) return null;
   return normalizeWebAsset(result.assets[0]);
@@ -62,6 +67,7 @@ export async function pickPhotoFromLibrary(): Promise<PickedMealPhoto | null> {
     mediaTypes: ['images'],
     quality: 0.72,
     base64: true,
+    exif: false,
   });
   if (result.canceled || !result.assets?.length) return null;
   return normalizeWebAsset(result.assets[0]);
