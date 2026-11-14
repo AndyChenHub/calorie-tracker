@@ -11,6 +11,9 @@ import {
   computeHealthScoreFromMacros,
   DEFAULT_PREFERENCES,
   DEFAULT_USER_PROFILE,
+  mlToWaterSteps,
+  WATER_STEP_ML,
+  waterStepsToMl,
 } from '../constants/plateCatalog';
 import {
   analyzeMealWithAI,
@@ -110,6 +113,7 @@ interface CalorieContextValue {
   updatePreferences: (patch: Partial<AppPreferences>) => Promise<void>;
   waterByDate: Record<string, number>;
   setWaterForDate: (dateKey: string, glasses: number) => Promise<void>;
+  addWaterMl: (deltaMl: number, dateKey?: string) => Promise<number>;
   stepsByDate: Record<string, number>;
   setStepsForDate: (dateKey: string, steps: number) => Promise<void>;
   auth: ProviderAuthConfig;
@@ -123,6 +127,7 @@ interface CalorieContextValue {
   saveMealEntry: (entry: MealEntry) => Promise<void>;
   removeMealEntry: (id: string) => Promise<void>;
   startMealAnalysisJob: (params: StartMealAnalysisParams) => Promise<void>;
+  refiningByEntryId: Record<string, string>;
   refineMealEntry: (entryId: string, instruction: string) => Promise<boolean>;
   clearAllLogs: () => Promise<void>;
   exportBackupJson: () => Promise<string>;
@@ -159,6 +164,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     toLocalDateKey()
   );
   const [meals, setMeals] = useState<MealEntry[]>([]);
+  const [refiningByEntryId, setRefiningByEntryId] = useState<
+    Record<string, string>
+  >({});
   const [goals, setGoals] = useState<UserGoals>(DEFAULT_GOALS);
   const [profile, setProfile] = useState<UserProfile>(DEFAULT_USER_PROFILE);
   const [preferences, setPreferences] =
@@ -168,15 +176,19 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
   const [auth, setAuth] = useState<ProviderAuthConfig>(() =>
     getDefaultAuthConfig()
   );
+  const mealsRef = useRef<MealEntry[]>(meals);
+  const waterRef = useRef<Record<string, number>>(waterByDate);
   const profileRef = useRef<UserProfile>(profile);
   const preferencesRef = useRef<AppPreferences>(preferences);
   const authRef = useRef<ProviderAuthConfig>(auth);
 
   useEffect(() => {
+    mealsRef.current = meals;
+    waterRef.current = waterByDate;
     profileRef.current = profile;
     preferencesRef.current = preferences;
     authRef.current = auth;
-  }, [profile, preferences, auth]);
+  }, [meals, waterByDate, profile, preferences, auth]);
   const [companionStatus, setCompanionStatus] =
     useState<CompanionStatusResponse | null>(null);
   const [isCheckingCompanion, setIsCheckingCompanion] = useState(false);
@@ -329,6 +341,8 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         void ensureAIDiagnosticLogsLoaded();
 
         if (!mounted) return;
+        mealsRef.current = initialMeals;
+        waterRef.current = initialWater;
         profileRef.current = initialProfile;
         preferencesRef.current = loadedPrefs;
         authRef.current = loadedAuth;
@@ -446,12 +460,35 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
   const setWaterForDate = useCallback(
     async (dateKey: string, glasses: number) => {
-      const clamped = Math.max(0, Math.min(20, Math.round(glasses)));
-      const next = { ...waterByDate, [dateKey]: clamped };
+      // Preserve 1 mL precision (1 unit = 250 mL, max 40 units = 10,000 mL = 10 L)
+      const clamped = Math.max(
+        0,
+        Math.min(40, Math.round(glasses * WATER_STEP_ML) / WATER_STEP_ML)
+      );
+      const next = { ...waterRef.current, [dateKey]: clamped };
+      waterRef.current = next;
       setWaterByDate(next);
       await saveWaterByDate(next);
     },
-    [waterByDate]
+    []
+  );
+
+  const addWaterMl = useCallback(
+    async (deltaMl: number, dateKey?: string): Promise<number> => {
+      const targetKey = dateKey || selectedDateKey || toLocalDateKey();
+      const currentMl = waterStepsToMl(waterRef.current[targetKey] ?? 0);
+      const nextMl = Math.max(
+        0,
+        Math.min(10000, Math.round(currentMl + deltaMl))
+      );
+      const nextSteps = mlToWaterSteps(nextMl);
+      const next = { ...waterRef.current, [targetKey]: nextSteps };
+      waterRef.current = next;
+      setWaterByDate(next);
+      await saveWaterByDate(next);
+      return nextMl;
+    },
+    [selectedDateKey]
   );
 
   const setStepsForDate = useCallback(
@@ -477,6 +514,8 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
   const importBackupJson = useCallback(async (rawJson: string) => {
     const restored = await restorePortableBackupJson(rawJson);
+    mealsRef.current = restored.meals;
+    waterRef.current = restored.waterByDate;
     profileRef.current = restored.profile;
     preferencesRef.current = restored.preferences;
     authRef.current = restored.auth;
@@ -494,18 +533,25 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
     await upsertMeal(entry);
     setMeals((prev) => {
       const idx = prev.findIndex((m) => m.id === entry.id);
+      let next: MealEntry[];
       if (idx >= 0) {
-        const copy = [...prev];
-        copy[idx] = entry;
-        return copy;
+        next = [...prev];
+        next[idx] = entry;
+      } else {
+        next = [entry, ...prev];
       }
-      return [entry, ...prev];
+      mealsRef.current = next;
+      return next;
     });
   }, []);
 
   const removeMealEntry = useCallback(async (id: string) => {
     await deleteMealById(id);
-    setMeals((prev) => prev.filter((m) => m.id !== id));
+    setMeals((prev) => {
+      const next = prev.filter((m) => m.id !== id);
+      mealsRef.current = next;
+      return next;
+    });
   }, []);
 
   const startMealAnalysisJob = useCallback(
@@ -568,7 +614,11 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         items: [],
       };
 
-      setMeals((prev) => [pendingEntry, ...prev]);
+      setMeals((prev) => {
+        const next = [pendingEntry, ...prev];
+        mealsRef.current = next;
+        return next;
+      });
 
       const startedAt = Date.now();
       const progressTimer = setInterval(() => {
@@ -630,14 +680,20 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         };
 
         await upsertMeal(finalEntry);
-        setMeals((prev) =>
-          prev.map((m) => (m.id === entryId ? finalEntry : m))
-        );
+        setMeals((prev) => {
+          const next = prev.map((m) => (m.id === entryId ? finalEntry : m));
+          mealsRef.current = next;
+          return next;
+        });
         showToast('Meal analyzed');
         setTimeout(() => setDetailEntryId(entryId), 550);
       } catch (err) {
         clearInterval(progressTimer);
-        setMeals((prev) => prev.filter((m) => m.id !== entryId));
+        setMeals((prev) => {
+          const next = prev.filter((m) => m.id !== entryId);
+          mealsRef.current = next;
+          return next;
+        });
         const msg = err instanceof Error ? err.message : 'Analysis failed';
         setLastAIError({
           title: 'AI Meal Scan Failed',
@@ -653,17 +709,19 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
   const refineMealEntry = useCallback(
     async (entryId: string, instruction: string): Promise<boolean> => {
-      const target = meals.find((m) => m.id === entryId);
-      if (!target || !instruction.trim()) return false;
+      const cleanInstruction = instruction.trim();
+      const target = mealsRef.current.find((m) => m.id === entryId);
+      if (!target || !cleanInstruction) return false;
 
+      const currentAuth = authRef.current;
       const effectiveProvider = resolveReadyProvider(
-        auth.activeProvider,
-        auth,
+        currentAuth.activeProvider,
+        currentAuth,
         companionStatus
       );
       const providerState = isProviderConfigured(
         effectiveProvider,
-        auth,
+        currentAuth,
         companionStatus
       );
 
@@ -672,14 +730,30 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         return false;
       }
 
+      const mult = target.servings ?? 1;
       const combinedNotes = [
-        `Current meal: ${target.title} (${target.calories} kcal, P ${target.protein}g, C ${target.carbs}g, F ${target.fat}g).`,
-        `Existing items: ${target.items.map((i) => `${i.name} (${i.calories} kcal)`).join(', ')}.`,
-        target.userNotes ? `Original notes: ${target.userNotes}` : '',
-        `User correction / fix request: ${instruction.trim()}`,
+        `Current logged meal: "${target.title}" (Total: ${Math.round(target.calories * mult)} kcal, Protein ${Math.round(target.protein * mult * 10) / 10} g, Carbs ${Math.round(target.carbs * mult * 10) / 10} g, Fat ${Math.round(target.fat * mult * 10) / 10} g).`,
+        target.items.length > 0
+          ? `Current items: ${target.items
+              .map((i) => {
+                const portionLabel = i.grams
+                  ? `${Math.round(i.grams * mult)} g`
+                  : i.portion || '1 serving';
+                return `${i.name} (${portionLabel}, ${Math.round(i.calories * mult)} kcal, P ${Math.round(i.protein * mult * 10) / 10}g, C ${Math.round(i.carbs * mult * 10) / 10}g, F ${Math.round(i.fat * mult * 10) / 10}g)`;
+              })
+              .join('; ')}.`
+          : '',
+        target.userNotes ? `Previous notes: ${target.userNotes}` : '',
+        `AUTHORITATIVE USER REFINEMENT / EDIT: ${cleanInstruction}`,
+        'Recalculate the COMPLETE updated meal and return updated items and exact updated total calories, protein (g), carbs (g), and fat (g). Strictly apply any removed items, added items, or changed portion sizes even if the attached photo shows the unedited meal.',
       ]
         .filter(Boolean)
         .join('\n');
+
+      setRefiningByEntryId((prev) => ({
+        ...prev,
+        [entryId]: cleanInstruction,
+      }));
 
       try {
         let b64: string | undefined;
@@ -694,20 +768,27 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
         const aiResult = await analyzeMealWithAI({
           provider: effectiveProvider,
-          auth,
+          auth: currentAuth,
           imageBase64: b64,
           mimeType: mime,
           userNotes: combinedNotes,
           mealType: target.mealType,
+          isRefinement: true,
         });
 
+        const latestTarget = mealsRef.current.find((m) => m.id === entryId);
+        if (!latestTarget) {
+          return false;
+        }
+
         const updated: MealEntry = {
-          ...target,
+          ...latestTarget,
           title: aiResult.title,
-          userNotes: instruction.trim(),
+          userNotes: cleanInstruction,
           aiProvider: aiResult.providerUsed,
           aiSummary: aiResult.summary,
           confidence: aiResult.confidence,
+          servings: 1,
           calories: aiResult.calories,
           protein: aiResult.protein,
           carbs: aiResult.carbs,
@@ -724,7 +805,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         };
 
         await saveMealEntry(updated);
-        showToast('Nutrition updated with AI');
+        showToast(
+          `Updated · ${Math.round(aiResult.calories)} kcal (P ${Math.round(aiResult.protein)}g · C ${Math.round(aiResult.carbs)}g · F ${Math.round(aiResult.fat)}g)`
+        );
         return true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Update failed';
@@ -736,9 +819,15 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         });
         showToast('AI update failed — see error details', 'error');
         return false;
+      } finally {
+        setRefiningByEntryId((prev) => {
+          const next = { ...prev };
+          delete next[entryId];
+          return next;
+        });
       }
     },
-    [auth, companionStatus, meals, saveMealEntry, showToast]
+    [companionStatus, saveMealEntry, showToast]
   );
 
   const clearAllLogs = useCallback(async () => {
@@ -748,6 +837,9 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       saveStepsByDate({}),
       saveHasSeededDemo(true),
     ]);
+    mealsRef.current = [];
+    waterRef.current = {};
+    setRefiningByEntryId({});
     setMeals([]);
     setWaterByDate({});
     setStepsByDate({});
@@ -789,6 +881,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       updatePreferences,
       waterByDate,
       setWaterForDate,
+      addWaterMl,
       stepsByDate,
       setStepsForDate,
       auth,
@@ -799,6 +892,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       saveMealEntry,
       removeMealEntry,
       startMealAnalysisJob,
+      refiningByEntryId,
       refineMealEntry,
       clearAllLogs,
       exportBackupJson,
@@ -834,6 +928,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       updatePreferences,
       waterByDate,
       setWaterForDate,
+      addWaterMl,
       stepsByDate,
       setStepsForDate,
       auth,
@@ -844,6 +939,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       saveMealEntry,
       removeMealEntry,
       startMealAnalysisJob,
+      refiningByEntryId,
       refineMealEntry,
       clearAllLogs,
       exportBackupJson,

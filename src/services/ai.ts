@@ -31,6 +31,7 @@ import {
   savePendingChatGPTPkce,
 } from './storage';
 import { stripImageMetadataBase64 } from '../utils/imagePrivacy';
+import type { BarcodeProductResult } from './barcode';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -491,7 +492,8 @@ Rules:
 3. Break the meal down into individual food/ingredient items with realistic gram/milliliter estimates, calories (kcal), protein (g), carbs (g), and fat (g).
 4. Ensure the top-level calories, protein, carbs, and fat equal the sum of the individual items.
 5. Include a "healthScore" integer from 1 to 10 based on nutrient density, whole foods, protein balance, and fiber.
-6. Return ONLY valid JSON matching this exact structure:
+6. When the user notes contain a MEAL REFINEMENT / EDIT or BARCODE CUSTOM PORTION request, the user's latest edit instruction is strictly authoritative and overrides BOTH any previous item breakdown AND anything visible in the photo. Remove, scale, replace, or add items exactly as instructed, recalculate every item's "grams"/"portion", "calories", "protein", "carbs", and "fat" from scratch, and set top-level "calories", "protein", "carbs", and "fat" to their exact sums.
+7. Return ONLY valid JSON matching this exact structure:
 {
   "title": "Concise appetizing meal name",
   "summary": "1-2 sentence explanation of metric portion assumptions (g / mL) and key calorie drivers",
@@ -1800,21 +1802,80 @@ function normalizeAnalysisPayload(
     };
   });
 
-  const calories = items.length
-    ? items.reduce((sum, i) => sum + i.calories, 0)
-    : Math.max(0, Math.round(Number(raw.calories) || 0));
+  const rawCalories = Math.max(0, Math.round(Number(raw.calories) || 0));
+  const rawProtein = Math.max(0, Number((Number(raw.protein) || 0).toFixed(1)));
+  const rawCarbs = Math.max(0, Number((Number(raw.carbs) || 0).toFixed(1)));
+  const rawFat = Math.max(0, Number((Number(raw.fat) || 0).toFixed(1)));
 
-  const protein = items.length
-    ? Number(items.reduce((sum, i) => sum + i.protein, 0).toFixed(1))
-    : Math.max(0, Number((Number(raw.protein) || 0).toFixed(1)));
+  let normalizedItems = items;
+  if (
+    normalizedItems.length === 0 &&
+    (rawCalories > 0 || rawProtein > 0 || rawCarbs > 0 || rawFat > 0)
+  ) {
+    normalizedItems = [
+      {
+        id: `item_${Date.now()}_0`,
+        name: String(raw.title || 'Analyzed Meal'),
+        grams: null,
+        calories: rawCalories,
+        protein: rawProtein,
+        carbs: rawCarbs,
+        fat: rawFat,
+      },
+    ];
+  } else if (normalizedItems.length > 0) {
+    const sumKcal = normalizedItems.reduce((s, i) => s + i.calories, 0);
+    const sumP = normalizedItems.reduce((s, i) => s + i.protein, 0);
+    const sumC = normalizedItems.reduce((s, i) => s + i.carbs, 0);
+    const sumF = normalizedItems.reduce((s, i) => s + i.fat, 0);
 
-  const carbs = items.length
-    ? Number(items.reduce((sum, i) => sum + i.carbs, 0).toFixed(1))
-    : Math.max(0, Number((Number(raw.carbs) || 0).toFixed(1)));
+    if (
+      (sumKcal === 0 && rawCalories > 0) ||
+      (sumP === 0 && rawProtein > 0) ||
+      (sumC === 0 && rawCarbs > 0) ||
+      (sumF === 0 && rawFat > 0)
+    ) {
+      const denom = sumKcal > 0 ? sumKcal : normalizedItems.length;
+      normalizedItems = normalizedItems.map((it) => {
+        const share = sumKcal > 0 ? it.calories / denom : 1 / denom;
+        return {
+          ...it,
+          calories:
+            sumKcal === 0 && rawCalories > 0
+              ? Math.round(rawCalories * share)
+              : it.calories,
+          protein:
+            sumP === 0 && rawProtein > 0
+              ? Number((rawProtein * share).toFixed(1))
+              : it.protein,
+          carbs:
+            sumC === 0 && rawCarbs > 0
+              ? Number((rawCarbs * share).toFixed(1))
+              : it.carbs,
+          fat:
+            sumF === 0 && rawFat > 0
+              ? Number((rawFat * share).toFixed(1))
+              : it.fat,
+        };
+      });
+    }
+  }
 
-  const fat = items.length
-    ? Number(items.reduce((sum, i) => sum + i.fat, 0).toFixed(1))
-    : Math.max(0, Number((Number(raw.fat) || 0).toFixed(1)));
+  const calories = normalizedItems.length
+    ? normalizedItems.reduce((sum, i) => sum + i.calories, 0)
+    : rawCalories;
+
+  const protein = normalizedItems.length
+    ? Number(normalizedItems.reduce((sum, i) => sum + i.protein, 0).toFixed(1))
+    : rawProtein;
+
+  const carbs = normalizedItems.length
+    ? Number(normalizedItems.reduce((sum, i) => sum + i.carbs, 0).toFixed(1))
+    : rawCarbs;
+
+  const fat = normalizedItems.length
+    ? Number(normalizedItems.reduce((sum, i) => sum + i.fat, 0).toFixed(1))
+    : rawFat;
 
   const confRaw = String(raw.confidence || 'medium').toLowerCase();
   const confidence: 'high' | 'medium' | 'low' =
@@ -1837,7 +1898,7 @@ function normalizeAnalysisPayload(
     carbs,
     fat,
     healthScore,
-    items,
+    items: normalizedItems,
     providerUsed: provider,
     modelUsed,
   };
@@ -1850,6 +1911,7 @@ export interface AnalyzeMealInput {
   mimeType?: string;
   userNotes?: string;
   mealType?: MealType;
+  isRefinement?: boolean;
 }
 
 export async function analyzeMealWithAI(
@@ -1862,6 +1924,7 @@ export async function analyzeMealWithAI(
     mimeType = 'image/jpeg',
     userNotes,
     mealType,
+    isRefinement = false,
   } = input;
 
   if (!imageBase64 && !userNotes?.trim()) {
@@ -1869,6 +1932,15 @@ export async function analyzeMealWithAI(
       'Take or upload a meal photo, or describe what you ate with gram amounts.'
     );
   }
+
+  const effectiveNotes =
+    isRefinement && userNotes?.trim()
+      ? [
+          'MEAL REFINEMENT / EDIT MODE (STRICTLY OVERRIDE PREVIOUS TOTALS & PHOTO):',
+          userNotes.trim(),
+          'IMPORTANT: Apply the user edit/refinement above strictly. Remove any items the user excluded (even if visible in the photo), add any new items, rescale portions/counts, and recalculate EVERY item\'s metric portion (g/mL), calories, protein, carbs, and fat as well as the top-level calories, protein, carbs, and fat so the returned macros reflect the exact edited meal.',
+        ].join('\n')
+      : userNotes;
 
   const sanitizedImageBase64 = imageBase64
     ? stripImageMetadataBase64(imageBase64)
@@ -1881,7 +1953,7 @@ export async function analyzeMealWithAI(
   logAIDiagnostic(
     'info',
     `scan/${effectiveProvider}`,
-    `Starting meal analysis (provider=${effectiveProvider}, image=${imageKb}, mealType=${mealType || 'auto'})`,
+    `Starting ${isRefinement ? 'meal refinement' : 'meal analysis'} (provider=${effectiveProvider}, image=${imageKb}, mealType=${mealType || 'auto'})`,
     userNotes?.trim() ? `Notes: ${userNotes.trim()}` : undefined
   );
 
@@ -1892,7 +1964,7 @@ export async function analyzeMealWithAI(
         auth,
         sanitizedImageBase64,
         mimeType,
-        userNotes,
+        effectiveNotes,
         mealType
       );
     } else if (effectiveProvider === 'claude') {
@@ -1900,7 +1972,7 @@ export async function analyzeMealWithAI(
         auth,
         sanitizedImageBase64,
         mimeType,
-        userNotes,
+        effectiveNotes,
         mealType
       );
     } else {
@@ -1908,7 +1980,7 @@ export async function analyzeMealWithAI(
         auth,
         sanitizedImageBase64,
         mimeType,
-        userNotes,
+        effectiveNotes,
         mealType
       );
     }
@@ -1916,7 +1988,7 @@ export async function analyzeMealWithAI(
     logAIDiagnostic(
       'ok',
       `scan/${result.providerUsed}`,
-      `Meal analyzed: "${result.title}" (${result.calories} kcal · model=${result.modelUsed || 'default'})`
+      `Meal ${isRefinement ? 'refined' : 'analyzed'}: "${result.title}" (${result.calories} kcal, P ${result.protein}g, C ${result.carbs}g, F ${result.fat}g · model=${result.modelUsed || 'default'})`
     );
     return result;
   } catch (err) {
@@ -1924,10 +1996,118 @@ export async function analyzeMealWithAI(
     logAIDiagnostic(
       'error',
       `scan/${effectiveProvider}`,
-      `Meal analysis failed: ${msg}`
+      `Meal ${isRefinement ? 'refinement' : 'analysis'} failed: ${msg}`
     );
     throw err;
   }
+}
+
+export interface CalculateBarcodePortionParams {
+  auth: ProviderAuthConfig;
+  companionStatus?: CompanionStatusResponse | null;
+  instruction: string;
+  baseProduct?: BarcodeProductResult | null;
+}
+
+/**
+ * Calculates exact calories & macros for any natural-language portion or addition
+ * inside the Barcode Scanner (e.g. "I ate 5 chips", "half the can", "3 squares + 200 mL milk"),
+ * anchored to the scanned barcode's verified per-100g / per-serving label nutrition when available.
+ */
+export async function calculateBarcodePortionWithAI(
+  params: CalculateBarcodePortionParams
+): Promise<BarcodeProductResult> {
+  const { auth, companionStatus = null, instruction, baseProduct } = params;
+  const cleanInstruction = instruction.trim();
+  if (!cleanInstruction) {
+    throw new Error('Describe how much you ate (e.g. "5 chips" or "half the pack").');
+  }
+
+  const effectiveProvider = resolveReadyProvider(
+    auth.activeProvider,
+    auth,
+    companionStatus
+  );
+  const providerState = isProviderConfigured(
+    effectiveProvider,
+    auth,
+    companionStatus
+  );
+  if (!providerState.ready) {
+    throw new Error(
+      'Sign in to an AI provider in Settings first so AI can calculate custom portions.'
+    );
+  }
+
+  const promptLines: string[] = [
+    'BARCODE CUSTOM PORTION & NUTRITION CALCULATION:',
+  ];
+
+  if (baseProduct) {
+    const unit100 = baseProduct.per100?.unit || (baseProduct.grams !== null ? 'g' : 'mL');
+    promptLines.push(
+      `Scanned barcode product: "${baseProduct.title}"${baseProduct.brand ? ` (Brand: ${baseProduct.brand})` : ''} [Barcode: ${baseProduct.barcode}].`
+    );
+    if (baseProduct.per100) {
+      promptLines.push(
+        `Verified label nutrition per 100 ${unit100}: ${baseProduct.per100.calories} kcal, Protein ${baseProduct.per100.protein} g, Carbs ${baseProduct.per100.carbs} g, Fat ${baseProduct.per100.fat} g.`
+      );
+    }
+    promptLines.push(
+      `Package standard serving: ${baseProduct.rawServingSize || baseProduct.metricPortion} = ${baseProduct.calories} kcal, Protein ${baseProduct.protein} g, Carbs ${baseProduct.carbs} g, Fat ${baseProduct.fat} g.`
+    );
+    if (baseProduct.packageQuantity) {
+      promptLines.push(`Total package quantity: ${baseProduct.packageQuantity}.`);
+    }
+    promptLines.push(
+      `User ate / requested: "${cleanInstruction}"`,
+      'Instructions:',
+      `1. Convert the user's description ("${cleanInstruction}") into a realistic metric weight (g) or volume (mL) — e.g. if they ate "5 chips" and don't know the serving weight, use any piece count in the package serving hint or standard piece weight (e.g. 1 potato/tortilla chip ≈ 1.8–2.0 g, so 5 chips ≈ 9–10 g).`,
+      '2. Multiply that metric weight/volume by the verified barcode label nutrition density above to compute exact calories, protein, carbs, and fat. If the user also added extra foods/drinks/dips, include them as separate items with accurate metric portions and macros.',
+      '3. Set each item\'s "portion" in metric units (e.g. "10 g (5 chips)" or "165 mL") and explain the conversion briefly in "summary".'
+    );
+  } else {
+    promptLines.push(
+      `User ate / requested (no barcode scanned yet): "${cleanInstruction}"`,
+      'Estimate realistic metric weight/volume (g or mL) for the exact piece count or description given by the user, and calculate accurate calories, protein, carbs, and fat.'
+    );
+  }
+
+  const aiResult = await analyzeMealWithAI({
+    provider: effectiveProvider,
+    auth,
+    userNotes: promptLines.join('\n'),
+    isRefinement: true,
+  });
+
+  const totalGrams = aiResult.items.every((it) => (it.grams ?? 0) > 0)
+    ? aiResult.items.reduce((s, it) => s + (it.grams ?? 0), 0)
+    : aiResult.items[0]?.grams ?? null;
+
+  const primaryPortion =
+    aiResult.items.length === 1 && aiResult.items[0]?.portion
+      ? aiResult.items[0].portion
+      : totalGrams
+        ? `${totalGrams} g (${cleanInstruction})`
+        : cleanInstruction;
+
+  return {
+    barcode: baseProduct?.barcode || 'ai-custom',
+    title: baseProduct && aiResult.items.length === 1 ? baseProduct.title : aiResult.title,
+    brand: baseProduct?.brand,
+    metricPortion: primaryPortion,
+    grams: totalGrams,
+    calories: aiResult.calories,
+    protein: aiResult.protein,
+    carbs: aiResult.carbs,
+    fat: aiResult.fat,
+    healthScore: aiResult.healthScore ?? baseProduct?.healthScore ?? 6,
+    summary: aiResult.summary,
+    per100: baseProduct?.per100,
+    rawServingSize: baseProduct?.rawServingSize,
+    packageQuantity: baseProduct?.packageQuantity,
+    items: aiResult.items,
+  };
 }
 
 interface RichAIError extends Error {

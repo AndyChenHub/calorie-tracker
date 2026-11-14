@@ -1,6 +1,14 @@
 import { computeHealthScoreFromMacros } from '../constants/plateCatalog';
 import { MealItem } from '../types/models';
 
+export interface BarcodePer100Stats {
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+  unit: 'g' | 'mL';
+}
+
 export interface BarcodeProductResult {
   barcode: string;
   title: string;
@@ -14,6 +22,9 @@ export interface BarcodeProductResult {
   healthScore: number;
   summary: string;
   items: MealItem[];
+  per100?: BarcodePer100Stats;
+  rawServingSize?: string;
+  packageQuantity?: string;
 }
 
 interface OfflineBarcodeSeed {
@@ -26,6 +37,7 @@ interface OfflineBarcodeSeed {
   carbs: number;
   fat: number;
   nutriscore?: 'a' | 'b' | 'c' | 'd' | 'e';
+  rawServingSize?: string;
 }
 
 const OFFLINE_BARCODE_FALLBACKS: Record<string, OfflineBarcodeSeed> = {
@@ -72,6 +84,18 @@ const OFFLINE_BARCODE_FALLBACKS: Record<string, OfflineBarcodeSeed> = {
     carbs: 6,
     fat: 0,
     nutriscore: 'a',
+  },
+  '0028400090896': {
+    title: 'Classic Potato Chips',
+    brand: "Lay's",
+    amount: 28,
+    unit: 'g',
+    calories: 160,
+    protein: 2,
+    carbs: 15,
+    fat: 10,
+    nutriscore: 'd',
+    rawServingSize: '28 g (about 15 chips)',
   },
 };
 
@@ -155,6 +179,7 @@ function toSafeNum(val: unknown): number | null {
 function buildSeedResult(barcode: string, seed: OfflineBarcodeSeed): BarcodeProductResult {
   const metricPortion = `${seed.amount} ${seed.unit}`;
   const fullTitle = seed.brand ? `${seed.brand} ${seed.title}` : seed.title;
+  const factor100 = 100 / Math.max(1, seed.amount);
   const healthScore = nutriscoreToHealthScore(
     seed.nutriscore,
     seed.calories,
@@ -174,6 +199,14 @@ function buildSeedResult(barcode: string, seed: OfflineBarcodeSeed): BarcodeProd
     fat: seed.fat,
     healthScore,
     summary: `Verified barcode ${barcode} · per ${metricPortion} metric serving.`,
+    per100: {
+      calories: Math.round(seed.calories * factor100),
+      protein: Number((seed.protein * factor100).toFixed(1)),
+      carbs: Number((seed.carbs * factor100).toFixed(1)),
+      fat: Number((seed.fat * factor100).toFixed(1)),
+      unit: seed.unit,
+    },
+    rawServingSize: seed.rawServingSize || metricPortion,
     items: [
       {
         id: `bc_${barcode}`,
@@ -289,6 +322,23 @@ export async function lookupFoodBarcode(
           fat
         );
 
+        const safeRatio = ratio > 0 ? ratio : 1;
+        const per100: BarcodePer100Stats = {
+          calories: Math.round(
+            kcal100 !== null ? kcal100 : calories / safeRatio
+          ),
+          protein: Number(
+            (p100 !== null ? p100 : protein / safeRatio).toFixed(1)
+          ),
+          carbs: Number(
+            (c100 !== null ? c100 : carbs / safeRatio).toFixed(1)
+          ),
+          fat: Number((f100 !== null ? f100 : fat / safeRatio).toFixed(1)),
+          unit: serving.unit,
+        };
+        const rawServingSize = String(prod.serving_size || '').trim() || undefined;
+        const packageQuantity = String(prod.quantity || '').trim() || undefined;
+
         return {
           barcode: digits,
           title,
@@ -301,6 +351,9 @@ export async function lookupFoodBarcode(
           fat,
           healthScore,
           summary: `Open Food Facts barcode ${digits} · nutrition per ${metricPortion}.`,
+          per100,
+          rawServingSize,
+          packageQuantity,
           items: [
             {
               id: `bc_${digits}`,

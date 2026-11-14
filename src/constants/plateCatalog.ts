@@ -15,11 +15,19 @@ export type MetricPortionUnit = 'g' | 'mL';
 export const WATER_STEP_ML = 250;
 export const WATER_STEP_LITERS = 0.25;
 
+export function waterStepsToMl(steps250ml: number): number {
+  return Math.max(0, Math.round((steps250ml || 0) * WATER_STEP_ML));
+}
+
+export function mlToWaterSteps(ml: number): number {
+  return Math.max(0, Math.round(ml || 0)) / WATER_STEP_ML;
+}
+
 export function formatWaterLiters(steps250ml: number): string {
-  const safeSteps = Math.max(0, Math.round(steps250ml || 0));
-  if (safeSteps === 0) return '0 L';
-  const liters = safeSteps * WATER_STEP_LITERS;
-  const decimals = safeSteps % 2 === 0 ? 1 : 2;
+  const ml = waterStepsToMl(steps250ml);
+  if (ml === 0) return '0 L';
+  const liters = ml / 1000;
+  const decimals = ml % 100 === 0 ? 1 : 2;
   return `${liters.toFixed(decimals)} L`;
 }
 

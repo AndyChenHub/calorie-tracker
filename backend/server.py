@@ -129,7 +129,7 @@ class AnalyzeRequest(BaseModel):
     model: Optional[str] = None
 
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 
 
 def _parse_allowed_origins() -> list[str]:

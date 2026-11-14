@@ -3,7 +3,7 @@
     "name": "Plate",
     "slug": "calorie-tracker",
     "scheme": "calorietracker",
-    "version": "1.1.5",
+    "version": "1.1.6",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -14,7 +14,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.calorielens.tracker",
-      "buildNumber": "7",
+      "buildNumber": "8",
       "config": {
         "usesNonExemptEncryption": false
       },
@@ -28,7 +28,7 @@
     },
     "android": {
       "package": "com.calorielens.tracker",
-      "versionCode": 7,
+      "versionCode": 8,
       "adaptiveIcon": {
         "backgroundColor": "#121216",
         "foregroundImage": "./assets/android-icon-foreground.png",

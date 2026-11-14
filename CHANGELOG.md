@@ -5,6 +5,16 @@ All notable changes to **CalorieLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.6] - 2026-11-14 (Build 8)
+
+### Added
+- **Metric Water Logging (`PlateHomeView.tsx`, `PlateOverlays.tsx`, `CalorieContext.tsx`)**: Added an always-visible Home Hydration bar with 1-tap `-250 mL` / `+250 mL` buttons, **Log water** in the `+` Quick Actions menu, and a dedicated **Water Sheet** with `+250 mL`, `+330 mL`, `+500 mL`, `+750 mL`, and `+1 L` presets plus custom `mL` stepper/input and daily reset.
+- **Barcode AI Custom Portions & Natural-Language Queries (`PlateOverlays.tsx`, `barcode.ts`, `ai.ts`)**: Added an **AI Custom Portion / Additions** input inside scanned barcode cards (anchored to verified label nutrition per `100 g` / `100 mL` and manufacturer serving size so inputs like `"5 chips"` or `"half the packet + 30 g salsa"` calculate exact calories and macros with a 1-tap **Reset**), plus direct natural-language **Ask AI** queries from the Barcode scanner bar.
+- **One-Time AI Accuracy Disclaimer on Initial Setup (`onboarding.tsx`, `storage.ts`)**: Added a persisted one-time **AI Nutrition & Accuracy Notice** modal (`ai_disclaimer_seen_v1`) on first visit to Initial Setup plus a compact inline disclaimer notice above **Continue to Plate**.
+
+### Fixed
+- **Background AI Refinement Indicators & Authoritative Macro Updates (`CalorieContext.tsx`, `ai.ts`, `PlateHomeView.tsx`, `PlateOverlays.tsx`)**: Made meal refinements run asynchronously in the background with live animated status banners/badges on both the Home feed and Nutrition Detail sheet, added manual/AI ingredient macro editing and recalculation on ingredient removal, and hardened `refineMealEntry` + `normalizeAnalysisPayload` so user corrections authoritatively update calories, protein, carbs, fats, and health scores.
+
 ## [1.1.5] - 2026-11-14 (Build 7)
 
 ### Security

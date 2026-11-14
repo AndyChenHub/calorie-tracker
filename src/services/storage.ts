@@ -86,6 +86,7 @@ const MIRRORED_SETTING_KEYS = [
   'app_preferences',
   'provider_prefs',
   'onboarding_completed',
+  'ai_disclaimer_seen_v1',
   'has_seeded_demo',
   'purged_legacy_demo_seed_v1',
 ] as const;
@@ -1111,6 +1112,14 @@ export async function saveOnboardingCompleted(
   completed: boolean
 ): Promise<void> {
   await setSettingValue('onboarding_completed', completed ? 'true' : 'false');
+}
+
+export async function loadAIDisclaimerSeen(): Promise<boolean> {
+  return (await getSettingValue('ai_disclaimer_seen_v1')) === 'true';
+}
+
+export async function saveAIDisclaimerSeen(seen: boolean): Promise<void> {
+  await setSettingValue('ai_disclaimer_seen_v1', seen ? 'true' : 'false');
 }
 
 /**

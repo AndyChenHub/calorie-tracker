@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   Keyboard,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -45,6 +46,10 @@ import {
   subscribeAIDiagnosticLogs,
   verifyAIConnection,
 } from '../services/ai';
+import {
+  loadAIDisclaimerSeen,
+  saveAIDisclaimerSeen,
+} from '../services/storage';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import {
   AIConnectionTestResult,
@@ -181,18 +186,31 @@ export default function OnboardingScreen() {
   );
   const [logsOpen, setLogsOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [showAiDisclaimerModal, setShowAiDisclaimerModal] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
 
   useEffect(() => {
+    let active = true;
     const unsub = subscribeAIDiagnosticLogs(setAiLogs);
+    void loadAIDisclaimerSeen().then((seen) => {
+      if (active && !seen) {
+        setShowAiDisclaimerModal(true);
+      }
+    });
     return () => {
+      active = false;
       unsub();
       deviceCodeAbortRef.current?.abort();
     };
   }, []);
+
+  const handleAcknowledgeAiDisclaimer = async () => {
+    setShowAiDisclaimerModal(false);
+    await saveAIDisclaimerSeen(true);
+  };
 
   const parsedCalories = Math.max(
     800,
@@ -687,6 +705,7 @@ export default function OnboardingScreen() {
         openaiApiKey: openaiKey.trim(),
         geminiApiKey: geminiKey.trim(),
       });
+      await saveAIDisclaimerSeen(true);
       await completeOnboarding();
       router.replace('/');
     } finally {
@@ -1726,6 +1745,15 @@ export default function OnboardingScreen() {
               </View>
             ) : null}
           </View>
+          {/* Inline AI Accuracy Note */}
+          <View style={styles.aiDisclaimerInlineCard}>
+            <PlateIcon name="sparkle" size={15} color={plateColors.ink2} />
+            <Text style={styles.aiDisclaimerInlineText}>
+              Plate uses AI to estimate portions, calories, and macros from
+              photos, barcodes, and descriptions. Estimates may not be fully
+              accurate and are for informational wellness tracking only.
+            </Text>
+          </View>
         </ScrollView>
 
         {keyboard.visible ? (
@@ -1757,6 +1785,51 @@ export default function OnboardingScreen() {
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      {/* One-Time AI Accuracy Disclaimer Modal */}
+      <Modal
+        visible={showAiDisclaimerModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => void handleAcknowledgeAiDisclaimer()}
+      >
+        <View style={styles.disclaimerBackdrop}>
+          <View style={[styles.disclaimerModalCard, cardShadow]}>
+            <View style={styles.disclaimerIconCircle}>
+              <PlateIcon name="sparkle" size={22} color={plateColors.ink} />
+            </View>
+
+            <Text style={styles.disclaimerTitle}>
+              AI Nutrition & Accuracy Notice
+            </Text>
+
+            <Text style={styles.disclaimerBody}>
+              Plate uses artificial intelligence to analyze meal photos, text
+              descriptions, refinements, and custom barcode portions to estimate
+              calories and macronutrients (protein, carbs, and fats).
+            </Text>
+
+            <View style={styles.disclaimerBulletBox}>
+              <Text style={styles.disclaimerBulletText}>
+                {'• AI estimates may not be fully accurate due to hidden ingredients, cooking oils, preparation methods, or portion variations.'}
+              </Text>
+              <Text style={styles.disclaimerBulletText}>
+                {'• Always verify packaged food labels or consult a qualified healthcare professional for medical or dietary needs.'}
+              </Text>
+            </View>
+
+            <Pressable
+              onPress={() => void handleAcknowledgeAiDisclaimer()}
+              style={({ pressed }) => [
+                styles.disclaimerAckBtn,
+                pressed ? { transform: [{ scale: 0.98 }] } : null,
+              ]}
+            >
+              <Text style={styles.disclaimerAckBtnText}>I Understand</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </PhoneStageFrame>
   );
 }
@@ -2406,5 +2479,86 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '600',
+  },
+  aiDisclaimerInlineCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 9,
+    backgroundColor: plateColors.card,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  aiDisclaimerInlineText: {
+    flex: 1,
+    fontSize: 12,
+    lineHeight: 17,
+    color: plateColors.muted,
+    fontWeight: '500',
+  },
+  disclaimerBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.52)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 22,
+  },
+  disclaimerModalCard: {
+    width: '100%',
+    maxWidth: 372,
+    backgroundColor: plateColors.card,
+    borderRadius: 28,
+    padding: 22,
+    gap: 12,
+  },
+  disclaimerIconCircle: {
+    width: 44,
+    height: 44,
+    borderRadius: 15,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  disclaimerTitle: {
+    fontSize: 19,
+    fontWeight: '700',
+    color: plateColors.ink,
+    letterSpacing: -0.4,
+  },
+  disclaimerBody: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: plateColors.ink2,
+    fontWeight: '500',
+  },
+  disclaimerBulletBox: {
+    backgroundColor: plateColors.bg,
+    borderRadius: 16,
+    paddingHorizontal: 13,
+    paddingVertical: 11,
+    gap: 7,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  disclaimerBulletText: {
+    fontSize: 12.5,
+    lineHeight: 18,
+    color: plateColors.muted,
+    fontWeight: '500',
+  },
+  disclaimerAckBtn: {
+    marginTop: 4,
+    height: 50,
+    borderRadius: 99,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  disclaimerAckBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15.5,
+    fontWeight: '700',
   },
 });

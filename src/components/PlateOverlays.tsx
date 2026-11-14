@@ -22,14 +22,22 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   CATALOG_EXERCISES,
   CATALOG_FOODS,
+  computeHealthScoreFromMacros,
   createExerciseMealEntry,
   createFoodMealEntry,
   estimateStepMeters,
   formatNum,
+  formatWaterLiters,
+  mlToWaterSteps,
   resolveMealImageSource,
   upsertWeightLogPoint,
+  waterStepsToMl,
 } from '../constants/plateCatalog';
 import { PlateTabId, useCalorieTracker } from '../context/CalorieContext';
+import {
+  calculateBarcodePortionWithAI,
+  resolveReadyProvider,
+} from '../services/ai';
 import {
   BarcodeProductResult,
   lookupFoodBarcode,
@@ -41,7 +49,7 @@ import {
   pickPhotoFromLibrary,
 } from '../services/photos';
 import { cardShadow, colors, plateColors } from '../theme/colors';
-import { MealEntry, MealItem } from '../types/models';
+import { AIProviderId, MealEntry, MealItem } from '../types/models';
 import {
   formatTimeShort,
   inferMealTypeByHour,
@@ -75,6 +83,7 @@ export type ActiveSheetType =
   | 'exerciseDetail'
   | 'weight'
   | 'steps'
+  | 'water'
   | 'profile'
   | null;
 
@@ -491,6 +500,167 @@ function StepsSheetBody({ onClose }: { onClose: () => void }) {
   );
 }
 
+const WATER_QUICK_ADD_PRESETS: { ml: number; label: string; sub: string }[] = [
+  { ml: 250, label: '+250 mL', sub: 'Glass' },
+  { ml: 330, label: '+330 mL', sub: 'Can' },
+  { ml: 500, label: '+500 mL', sub: 'Bottle' },
+  { ml: 750, label: '+750 mL', sub: 'Sports' },
+  { ml: 1000, label: '+1 L', sub: 'Large' },
+];
+
+function WaterSheetBody({ onClose }: { onClose: () => void }) {
+  const {
+    selectedDateKey,
+    waterByDate,
+    setWaterForDate,
+    addWaterMl,
+    goals,
+    showToast,
+  } = useCalorieTracker();
+
+  const currentSteps = waterByDate[selectedDateKey] ?? 0;
+  const currentMl = waterStepsToMl(currentSteps);
+  const goalMl = Math.max(250, waterStepsToMl(goals.waterGlasses));
+  const [customMlDraft, setCustomMlDraft] = useState<string | null>(null);
+  const mlDraft = customMlDraft ?? String(currentMl);
+
+  const parsedDraftMl = Math.max(
+    0,
+    Math.min(15000, Math.round(Number(mlDraft.replace(',', '.')) || 0))
+  );
+
+  const handleQuickAdd = async (deltaMl: number, label: string) => {
+    Keyboard.dismiss();
+    const nextMl = await addWaterMl(deltaMl, selectedDateKey);
+    setCustomMlDraft(null);
+    showToast(
+      `${label} logged · ${formatWaterLiters(mlToWaterSteps(nextMl))} today`
+    );
+  };
+
+  const stepDraftMl = (delta: number) => {
+    const next = Math.max(0, Math.min(15000, parsedDraftMl + delta));
+    setCustomMlDraft(String(next));
+  };
+
+  const pct = Math.min(1, currentMl / goalMl);
+
+  return (
+    <View style={{ gap: 12 }}>
+      <View style={styles.waterSheetTopRow}>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.sheetTitle, { marginBottom: 2 }]}>
+            Log water
+          </Text>
+          <Text style={[styles.sheetSub, { marginBottom: 0 }]}>
+            {`${formatWaterLiters(currentSteps)} (${formatNum(
+              currentMl
+            )} mL) of ${formatWaterLiters(goals.waterGlasses)} goal`}
+          </Text>
+        </View>
+        {currentMl > 0 ? (
+          <Pressable
+            onPress={async () => {
+              Keyboard.dismiss();
+              await setWaterForDate(selectedDateKey, 0);
+              setCustomMlDraft(null);
+              showToast('Water reset to 0 mL');
+            }}
+            style={styles.waterResetChip}
+          >
+            <Text style={styles.waterResetChipText}>Reset</Text>
+          </Pressable>
+        ) : null}
+      </View>
+
+      <View style={styles.waterSheetProgressTrack}>
+        <View
+          style={[
+            styles.waterSheetProgressFill,
+            { width: `${Math.round(pct * 100)}%` },
+          ]}
+        />
+      </View>
+
+      <Text style={styles.fieldLabel}>Quick add drink</Text>
+      <View style={styles.waterPresetGrid}>
+        {WATER_QUICK_ADD_PRESETS.map((preset) => (
+          <Pressable
+            key={preset.ml}
+            onPress={() => void handleQuickAdd(preset.ml, preset.label)}
+            style={({ pressed }) => [
+              styles.waterPresetBtn,
+              pressed ? { transform: [{ scale: 0.96 }] } : null,
+            ]}
+          >
+            <PlateIcon name="drop" size={14} color={plateColors.fat} />
+            <Text style={styles.waterPresetBtnLabel}>{preset.label}</Text>
+            <Text style={styles.waterPresetBtnSub}>{preset.sub}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <Text style={[styles.fieldLabel, { marginTop: 2 }]}>
+        Or set exact daily total (mL)
+      </Text>
+      <View style={[styles.bigStepperCenter, { marginVertical: 4 }]}>
+        <Pressable
+          onPress={() => stepDraftMl(-100)}
+          style={({ pressed }) => [
+            styles.roundLightBtn,
+            pressed ? { transform: [{ scale: 0.9 }] } : null,
+          ]}
+        >
+          <PlateIcon name="minus" size={18} color={plateColors.ink} />
+        </Pressable>
+
+        <View style={styles.weightInputInlineWrap}>
+          <TextInput
+            value={mlDraft}
+            onChangeText={setCustomMlDraft}
+            keyboardType="numeric"
+            returnKeyType="done"
+            onSubmitEditing={() => Keyboard.dismiss()}
+            selectTextOnFocus
+            maxLength={5}
+            style={[styles.weightStepperInput, { fontSize: 38, minWidth: 120 }]}
+          />
+          <Text style={styles.weightStepperUnit}>mL</Text>
+        </View>
+
+        <Pressable
+          onPress={() => stepDraftMl(100)}
+          style={({ pressed }) => [
+            styles.roundLightBtn,
+            pressed ? { transform: [{ scale: 0.9 }] } : null,
+          ]}
+        >
+          <PlateIcon name="plus" size={18} color={plateColors.ink} />
+        </Pressable>
+      </View>
+
+      <Pressable
+        onPress={async () => {
+          Keyboard.dismiss();
+          const nextSteps = mlToWaterSteps(parsedDraftMl);
+          await setWaterForDate(selectedDateKey, nextSteps);
+          onClose();
+          showToast(
+            `Water saved · ${formatWaterLiters(nextSteps)} (${formatNum(
+              parsedDraftMl
+            )} mL)`
+          );
+        }}
+        style={styles.sheetPrimaryBtn}
+      >
+        <Text style={styles.sheetPrimaryBtnText}>
+          {`Save water (${formatWaterLiters(mlToWaterSteps(parsedDraftMl))})`}
+        </Text>
+      </Pressable>
+    </View>
+  );
+}
+
 function ProfileSheetBody({
   onClose,
   keyboardVisible,
@@ -736,12 +906,18 @@ function ProfileSheetBody({
   );
 }
 
+function isLikelyBarcodeDigitsInput(raw: string): boolean {
+  const compact = raw.trim().replace(/[\s-]+/g, '');
+  return /^\d{6,18}$/.test(compact);
+}
+
 function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const isDesktopStage = useIsDesktopStage();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardState();
   const {
     auth,
+    companionStatus,
     selectedDateKey,
     saveMealEntry,
     setActiveTab,
@@ -766,8 +942,17 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const [barcodeInput, setBarcodeInput] = useState('');
   const [barcodeLoading, setBarcodeLoading] = useState(false);
   const [barcodeError, setBarcodeError] = useState<string | null>(null);
+  const [baseBarcodeResult, setBaseBarcodeResult] =
+    useState<BarcodeProductResult | null>(null);
   const [barcodeResult, setBarcodeResult] =
     useState<BarcodeProductResult | null>(null);
+  const [barcodeCustomPrompt, setBarcodeCustomPrompt] = useState('');
+  const [barcodeAppliedNote, setBarcodeAppliedNote] = useState<string | null>(
+    null
+  );
+  const [barcodeAiLoading, setBarcodeAiLoading] = useState(false);
+  const [barcodeAiProvider, setBarcodeAiProvider] =
+    useState<AIProviderId | null>(null);
 
   const [scanLineY] = useState(() => new Animated.Value(12));
   const [shutterFlash] = useState(() => new Animated.Value(0));
@@ -834,20 +1019,70 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
     return trimmed || undefined;
   };
 
+  const handleRunBarcodeAI = async (
+    rawInstruction: string,
+    anchorProduct: BarcodeProductResult | null
+  ) => {
+    const cleanInstruction = rawInstruction.trim();
+    if (!cleanInstruction || barcodeAiLoading) return;
+    Keyboard.dismiss();
+    setBarcodeAiLoading(true);
+    setBarcodeError(null);
+    try {
+      const updated = await calculateBarcodePortionWithAI({
+        auth,
+        companionStatus,
+        instruction: cleanInstruction,
+        baseProduct: anchorProduct,
+      });
+      setBarcodeResult(updated);
+      setBarcodeAppliedNote(cleanInstruction);
+      setBarcodeCustomPrompt('');
+      setBarcodeAiProvider(
+        resolveReadyProvider(auth.activeProvider, auth, companionStatus)
+      );
+      showToast(
+        `Calculated · ${updated.calories} kcal (P ${updated.protein}g · C ${updated.carbs}g · F ${updated.fat}g)`
+      );
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'AI portion calculation failed';
+      setBarcodeError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setBarcodeAiLoading(false);
+    }
+  };
+
   const handleLookupBarcode = async (rawCode: string) => {
-    const clean = sanitizeBarcodeDigits(rawCode);
-    if (!clean || barcodeLoading) return;
+    const trimmed = rawCode.trim();
+    if (!trimmed || barcodeLoading || barcodeAiLoading) return;
+
+    if (!isLikelyBarcodeDigitsInput(trimmed)) {
+      await handleRunBarcodeAI(trimmed, baseBarcodeResult ?? barcodeResult);
+      return;
+    }
+
+    const clean = sanitizeBarcodeDigits(trimmed);
+    if (!clean) return;
     Keyboard.dismiss();
     setBarcodeInput(clean);
     setBarcodeLoading(true);
     setBarcodeError(null);
     try {
       const product = await lookupFoodBarcode(clean);
+      setBaseBarcodeResult(product);
       setBarcodeResult(product);
+      setBarcodeAppliedNote(null);
+      setBarcodeCustomPrompt('');
+      setBarcodeAiProvider(null);
       showToast(`Found: ${product.title}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Barcode lookup failed';
+      setBaseBarcodeResult(null);
       setBarcodeResult(null);
+      setBarcodeAppliedNote(null);
+      setBarcodeAiProvider(null);
       setBarcodeError(msg);
       showToast(msg, 'error');
     } finally {
@@ -858,6 +1093,14 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
   const handleLogBarcodeProduct = async () => {
     if (!barcodeResult) return;
     const now = new Date();
+    const noteParts = [
+      barcodeResult.barcode !== 'ai-custom'
+        ? `Barcode: ${barcodeResult.barcode}`
+        : 'AI custom check',
+      `Portion: ${barcodeResult.metricPortion}`,
+      barcodeAppliedNote ? `AI request: ${barcodeAppliedNote}` : '',
+    ].filter(Boolean);
+
     const entry: MealEntry = {
       id: `meal_${now.getTime()}_${Math.random().toString(36).slice(2, 7)}`,
       dateKey: selectedDateKey,
@@ -865,8 +1108,8 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
       mealType: inferMealTypeByHour(now),
       title: barcodeResult.title,
       photoUri: null,
-      userNotes: `Barcode: ${barcodeResult.barcode} (${barcodeResult.metricPortion})`,
-      aiProvider: 'manual',
+      userNotes: noteParts.join(' · '),
+      aiProvider: barcodeAiProvider ?? 'manual',
       aiSummary: barcodeResult.summary,
       confidence: 'high',
       calories: barcodeResult.calories,
@@ -1116,75 +1359,183 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
       {/* Center Scan Frame + Animated Scanline (or Barcode Result / Permission Prompt) */}
       <View style={styles.scannerCenterArea}>
         {scanMode === 'barcode' && barcodeResult ? (
-          <View style={[styles.barcodeResultCard, cardShadow]}>
-            <View style={styles.barcodeResultTopRow}>
-              <View style={styles.barcodeBadgePill}>
-                <PlateIcon name="barcode" size={14} color={plateColors.ink} />
-                <Text style={styles.barcodeBadgeText}>
-                  {barcodeResult.barcode}
+          <ScrollView
+            style={styles.barcodeResultScroll}
+            contentContainerStyle={styles.barcodeResultScrollContent}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <View style={[styles.barcodeResultCard, cardShadow]}>
+              <View style={styles.barcodeResultTopRow}>
+                <View style={styles.barcodeBadgePill}>
+                  <PlateIcon
+                    name={
+                      barcodeResult.barcode === 'ai-custom'
+                        ? 'sparkle'
+                        : 'barcode'
+                    }
+                    size={14}
+                    color={plateColors.ink}
+                  />
+                  <Text style={styles.barcodeBadgeText}>
+                    {barcodeResult.barcode === 'ai-custom'
+                      ? 'AI Estimate'
+                      : barcodeResult.barcode}
+                  </Text>
+                </View>
+                <Text style={styles.barcodePortionPill} numberOfLines={1}>
+                  {barcodeAppliedNote
+                    ? barcodeResult.metricPortion
+                    : `Per ${barcodeResult.metricPortion}`}
                 </Text>
               </View>
-              <Text style={styles.barcodePortionPill}>
-                {`Per ${barcodeResult.metricPortion}`}
+
+              <Text style={styles.barcodeTitleText} numberOfLines={2}>
+                {barcodeResult.title}
               </Text>
-            </View>
 
-            <Text style={styles.barcodeTitleText} numberOfLines={2}>
-              {barcodeResult.title}
-            </Text>
+              <View style={styles.barcodeMetricsRow}>
+                <View style={styles.barcodeMetricBox}>
+                  <Text style={styles.barcodeMetricVal}>
+                    {barcodeResult.calories}
+                  </Text>
+                  <Text style={styles.barcodeMetricLbl}>kcal</Text>
+                </View>
+                <View style={styles.barcodeMetricBox}>
+                  <Text
+                    style={[
+                      styles.barcodeMetricVal,
+                      { color: plateColors.protein },
+                    ]}
+                  >
+                    {`${barcodeResult.protein} g`}
+                  </Text>
+                  <Text style={styles.barcodeMetricLbl}>Protein</Text>
+                </View>
+                <View style={styles.barcodeMetricBox}>
+                  <Text
+                    style={[
+                      styles.barcodeMetricVal,
+                      { color: plateColors.carbs },
+                    ]}
+                  >
+                    {`${barcodeResult.carbs} g`}
+                  </Text>
+                  <Text style={styles.barcodeMetricLbl}>Carbs</Text>
+                </View>
+                <View style={styles.barcodeMetricBox}>
+                  <Text
+                    style={[styles.barcodeMetricVal, { color: plateColors.fat }]}
+                  >
+                    {`${barcodeResult.fat} g`}
+                  </Text>
+                  <Text style={styles.barcodeMetricLbl}>Fat</Text>
+                </View>
+              </View>
 
-            <View style={styles.barcodeMetricsRow}>
-              <View style={styles.barcodeMetricBox}>
-                <Text style={styles.barcodeMetricVal}>
-                  {barcodeResult.calories}
-                </Text>
-                <Text style={styles.barcodeMetricLbl}>kcal</Text>
+              {/* Ask AI for Custom Portion or Extras */}
+              <View style={styles.barcodeAiBox}>
+                <View style={styles.barcodeAiHeaderRow}>
+                  <View style={styles.barcodeAiTitleWrap}>
+                    <PlateIcon
+                      name="sparkle"
+                      size={13}
+                      color={plateColors.ink}
+                    />
+                    <Text style={styles.barcodeAiTitle}>
+                      Custom portion or extras (Ask AI)
+                    </Text>
+                  </View>
+                  {barcodeAppliedNote && baseBarcodeResult ? (
+                    <Pressable
+                      onPress={() => {
+                        setBarcodeResult(baseBarcodeResult);
+                        setBarcodeAppliedNote(null);
+                        setBarcodeAiProvider(null);
+                      }}
+                      hitSlop={6}
+                    >
+                      <Text style={styles.barcodeAiResetLink}>
+                        {`Reset (${baseBarcodeResult.metricPortion})`}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+
+                {barcodeAppliedNote ? (
+                  <Text style={styles.barcodeAiAppliedText} numberOfLines={2}>
+                    {`Applied: "${barcodeAppliedNote}"`}
+                  </Text>
+                ) : null}
+
+                {barcodeAiLoading ? (
+                  <View style={styles.barcodeAiWorkingRow}>
+                    <ActivityIndicator size="small" color={plateColors.ink} />
+                    <Text style={styles.barcodeAiWorkingText}>
+                      AI calculating calories & macros…
+                    </Text>
+                  </View>
+                ) : null}
+
+                <View style={styles.barcodeAiInputRow}>
+                  <TextInput
+                    value={barcodeCustomPrompt}
+                    onChangeText={setBarcodeCustomPrompt}
+                    placeholder='e.g. "I ate 5 chips", "half bag", "+ 30 g dip"'
+                    placeholderTextColor={plateColors.faint}
+                    returnKeyType="go"
+                    onSubmitEditing={() =>
+                      void handleRunBarcodeAI(
+                        barcodeCustomPrompt,
+                        baseBarcodeResult ?? barcodeResult
+                      )
+                    }
+                    style={styles.barcodeAiInput}
+                  />
+                  <Pressable
+                    onPress={() =>
+                      void handleRunBarcodeAI(
+                        barcodeCustomPrompt,
+                        baseBarcodeResult ?? barcodeResult
+                      )
+                    }
+                    disabled={barcodeAiLoading || !barcodeCustomPrompt.trim()}
+                    style={[
+                      styles.barcodeAiCalcBtn,
+                      !barcodeCustomPrompt.trim() || barcodeAiLoading
+                        ? { opacity: 0.45 }
+                        : null,
+                    ]}
+                  >
+                    <Text style={styles.barcodeAiCalcBtnText}>Calculate</Text>
+                  </Pressable>
+                </View>
               </View>
-              <View style={styles.barcodeMetricBox}>
-                <Text
-                  style={[styles.barcodeMetricVal, { color: plateColors.protein }]}
+
+              <View style={styles.barcodeActionsRow}>
+                <Pressable
+                  onPress={() => {
+                    lastScannedCodeRef.current = '';
+                    setBaseBarcodeResult(null);
+                    setBarcodeResult(null);
+                    setBarcodeAppliedNote(null);
+                    setBarcodeCustomPrompt('');
+                    setBarcodeAiProvider(null);
+                    setBarcodeError(null);
+                  }}
+                  style={styles.barcodeResetBtn}
                 >
-                  {`${barcodeResult.protein} g`}
-                </Text>
-                <Text style={styles.barcodeMetricLbl}>Protein</Text>
-              </View>
-              <View style={styles.barcodeMetricBox}>
-                <Text
-                  style={[styles.barcodeMetricVal, { color: plateColors.carbs }]}
+                  <Text style={styles.barcodeResetBtnText}>Scan another</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => void handleLogBarcodeProduct()}
+                  style={styles.barcodeLogBtn}
                 >
-                  {`${barcodeResult.carbs} g`}
-                </Text>
-                <Text style={styles.barcodeMetricLbl}>Carbs</Text>
-              </View>
-              <View style={styles.barcodeMetricBox}>
-                <Text
-                  style={[styles.barcodeMetricVal, { color: plateColors.fat }]}
-                >
-                  {`${barcodeResult.fat} g`}
-                </Text>
-                <Text style={styles.barcodeMetricLbl}>Fat</Text>
+                  <Text style={styles.barcodeLogBtnText}>Add to Log</Text>
+                </Pressable>
               </View>
             </View>
-
-            <View style={styles.barcodeActionsRow}>
-              <Pressable
-                onPress={() => {
-                  lastScannedCodeRef.current = '';
-                  setBarcodeResult(null);
-                  setBarcodeError(null);
-                }}
-                style={styles.barcodeResetBtn}
-              >
-                <Text style={styles.barcodeResetBtnText}>Scan another</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => void handleLogBarcodeProduct()}
-                style={styles.barcodeLogBtn}
-              >
-                <Text style={styles.barcodeLogBtnText}>Add to Log</Text>
-              </Pressable>
-            </View>
-          </View>
+          </ScrollView>
         ) : !pickedPhoto && permission && !permission.granted && scanMode !== 'barcode' ? (
           <View style={styles.permissionCard}>
             <PlateIcon name="camera" size={28} color="#FFFFFF" />
@@ -1231,7 +1582,10 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
             {pickedPhoto
               ? 'Photo ready · tap shutter to analyze'
               : scanMode === 'barcode'
-                ? barcodeError || 'Point camera at barcode or enter digits below'
+                ? barcodeAiLoading
+                  ? 'AI is calculating calories & macros…'
+                  : barcodeError ||
+                    'Scan barcode, enter digits, or ask AI (e.g. "5 chips")'
                 : scanMode === 'label'
                   ? 'Point camera at nutrition facts label'
                   : 'Point camera at your meal & tap shutter'}
@@ -1249,32 +1603,48 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
 
         {scanMode === 'barcode' ? (
           <View style={styles.notesGlassWrap}>
-            <PlateIcon name="barcode" size={15} color="rgba(255,255,255,0.85)" />
+            <PlateIcon
+              name={
+                barcodeInput.trim() && !isLikelyBarcodeDigitsInput(barcodeInput)
+                  ? 'sparkle'
+                  : 'barcode'
+              }
+              size={15}
+              color="rgba(255,255,255,0.85)"
+            />
             <TextInput
               value={barcodeInput}
               onChangeText={(txt) => {
                 setBarcodeInput(txt);
                 if (barcodeError) setBarcodeError(null);
               }}
-              placeholder="Enter EAN / UPC barcode (e.g. 3017620422003)…"
+              placeholder={'Barcode digits OR ask AI (e.g. "5 Lay\'s chips")…'}
               placeholderTextColor="rgba(255,255,255,0.62)"
-              keyboardType="number-pad"
+              keyboardType="default"
+              autoCorrect={false}
               returnKeyType="search"
               onSubmitEditing={() => void handleLookupBarcode(barcodeInput)}
               style={styles.notesGlassInput}
             />
             <Pressable
               onPress={() => void handleLookupBarcode(barcodeInput)}
-              disabled={barcodeLoading || !barcodeInput.trim()}
+              disabled={
+                barcodeLoading || barcodeAiLoading || !barcodeInput.trim()
+              }
               style={[
                 styles.notesActionPill,
                 !barcodeInput.trim() ? { opacity: 0.45 } : null,
               ]}
             >
-              {barcodeLoading ? (
+              {barcodeLoading || barcodeAiLoading ? (
                 <ActivityIndicator size="small" color={plateColors.ink} />
               ) : (
-                <Text style={styles.notesActionPillText}>Look up</Text>
+                <Text style={styles.notesActionPillText}>
+                  {barcodeInput.trim() &&
+                  !isLikelyBarcodeDigitsInput(barcodeInput)
+                    ? 'Ask AI'
+                    : 'Look up'}
+                </Text>
               )}
             </Pressable>
           </View>
@@ -1409,6 +1779,7 @@ function NutritionDetailContent({
   const {
     saveMealEntry,
     removeMealEntry,
+    refiningByEntryId,
     refineMealEntry,
     showToast,
   } = useCalorieTracker();
@@ -1417,10 +1788,39 @@ function NutritionDetailContent({
   const [newIngName, setNewIngName] = useState('');
   const [newIngGrams, setNewIngGrams] = useState('');
   const [newIngKcal, setNewIngKcal] = useState('');
+  const [newIngProtein, setNewIngProtein] = useState('');
+  const [newIngCarbs, setNewIngCarbs] = useState('');
+  const [newIngFat, setNewIngFat] = useState('');
 
   const [showFixBox, setShowFixBox] = useState(false);
   const [fixPrompt, setFixPrompt] = useState('');
-  const [refining, setRefining] = useState(false);
+
+  const activeRefiningPrompt = refiningByEntryId[entry.id];
+  const isRefining = Boolean(activeRefiningPrompt);
+  const [macroPulse] = useState(() => new Animated.Value(1));
+
+  useEffect(() => {
+    if (!isRefining) {
+      macroPulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(macroPulse, {
+          toValue: 0.58,
+          duration: 620,
+          useNativeDriver: true,
+        }),
+        Animated.timing(macroPulse, {
+          toValue: 1,
+          duration: 620,
+          useNativeDriver: true,
+        }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isRefining, macroPulse]);
 
   const servings = entry.servings ?? 1;
   const imgSrc = resolveMealImageSource(entry);
@@ -1440,49 +1840,162 @@ function NutritionDetailContent({
     await saveMealEntry({ ...entry, servings: next });
   };
 
-  const handleAddIngredient = async () => {
+  const resetAddIngredientFields = () => {
+    setNewIngName('');
+    setNewIngGrams('');
+    setNewIngKcal('');
+    setNewIngProtein('');
+    setNewIngCarbs('');
+    setNewIngFat('');
+  };
+
+  const handleAddIngredientWithAI = () => {
     const cleanName = newIngName.trim();
-    const kcalNum = Math.max(0, Math.round(Number(newIngKcal) || 0));
-    const parsedGrams = Math.max(0, Math.round(Number(newIngGrams) || 0));
-    if (!cleanName || kcalNum <= 0) {
-      showToast('Enter ingredient name and kcal');
+    if (!cleanName) {
+      showToast('Enter an ingredient description first (e.g. "2 boiled eggs")');
       return;
     }
+    const parsedGrams = Math.max(
+      0,
+      Math.round(Number(newIngGrams.replace(',', '.')) || 0)
+    );
+    const instruction =
+      parsedGrams > 0
+        ? `Add ${cleanName} (${parsedGrams} g) to this meal and recalculate total calories and macros.`
+        : `Add ${cleanName} to this meal and recalculate total calories and macros.`;
+    Keyboard.dismiss();
+    resetAddIngredientFields();
+    setShowAddIng(false);
+    showToast('AI adding ingredient & updating macros in the background…');
+    void refineMealEntry(entry.id, instruction);
+  };
+
+  const handleAddIngredient = async () => {
+    const cleanName = newIngName.trim();
+    const parsedGrams = Math.max(
+      0,
+      Math.round(Number(newIngGrams.replace(',', '.')) || 0)
+    );
+    const pNum = Math.max(
+      0,
+      Math.round((Number(newIngProtein.replace(',', '.')) || 0) * 10) / 10
+    );
+    const cNum = Math.max(
+      0,
+      Math.round((Number(newIngCarbs.replace(',', '.')) || 0) * 10) / 10
+    );
+    const fNum = Math.max(
+      0,
+      Math.round((Number(newIngFat.replace(',', '.')) || 0) * 10) / 10
+    );
+    const rawKcal = Math.max(
+      0,
+      Math.round(Number(newIngKcal.replace(',', '.')) || 0)
+    );
+    const derivedKcal = Math.round(pNum * 4 + cNum * 4 + fNum * 9);
+    const kcalNum = rawKcal > 0 ? rawKcal : derivedKcal;
+
+    if (!cleanName) {
+      showToast('Enter ingredient name');
+      return;
+    }
+    if (kcalNum <= 0 && pNum <= 0 && cNum <= 0 && fNum <= 0) {
+      // If the user typed only a name (e.g. "2 eggs") and tapped Save without numbers, use AI!
+      handleAddIngredientWithAI();
+      return;
+    }
+
+    Keyboard.dismiss();
     const addedItem: MealItem = {
       id: `ing_${Date.now()}`,
       name: cleanName,
       grams: parsedGrams > 0 ? parsedGrams : null,
       portion: parsedGrams > 0 ? `${parsedGrams} g` : undefined,
       calories: kcalNum,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
+      protein: pNum,
+      carbs: cNum,
+      fat: fNum,
     };
     const nextItems = [...(entry.items || []), addedItem];
+    const nextCalories = Math.max(0, Math.round(entry.calories + kcalNum));
+    const nextProtein =
+      Math.round(Math.max(0, entry.protein + pNum) * 10) / 10;
+    const nextCarbs = Math.round(Math.max(0, entry.carbs + cNum) * 10) / 10;
+    const nextFat = Math.round(Math.max(0, entry.fat + fNum) * 10) / 10;
+
     await saveMealEntry({
       ...entry,
-      calories: entry.calories + kcalNum,
+      calories: nextCalories,
+      protein: nextProtein,
+      carbs: nextCarbs,
+      fat: nextFat,
+      healthScore: computeHealthScoreFromMacros(
+        nextCalories,
+        nextProtein,
+        nextCarbs,
+        nextFat
+      ),
       items: nextItems,
     });
-    setNewIngName('');
-    setNewIngGrams('');
-    setNewIngKcal('');
+    resetAddIngredientFields();
     setShowAddIng(false);
-    showToast(`${cleanName} added`);
+    showToast(`${cleanName} added · macros updated`);
   };
 
-  const handleRunFix = async () => {
-    if (!fixPrompt.trim()) {
+  const handleRemoveIngredient = async (itemId: string) => {
+    if ((entry.items?.length ?? 0) <= 1) {
+      showToast('At least one item is required — use Trash to delete entry');
+      return;
+    }
+    const removed = entry.items.find((i) => i.id === itemId);
+    const remaining = entry.items.filter((i) => i.id !== itemId);
+    if (!removed) return;
+
+    const itemsCarryMacros = remaining.some(
+      (i) => i.protein > 0 || i.carbs > 0 || i.fat > 0
+    );
+    const nextCalories = Math.max(
+      0,
+      Math.round(remaining.reduce((acc, i) => acc + i.calories, 0))
+    );
+    const nextProtein = itemsCarryMacros
+      ? Math.round(remaining.reduce((acc, i) => acc + i.protein, 0) * 10) / 10
+      : Math.round(Math.max(0, entry.protein - removed.protein) * 10) / 10;
+    const nextCarbs = itemsCarryMacros
+      ? Math.round(remaining.reduce((acc, i) => acc + i.carbs, 0) * 10) / 10
+      : Math.round(Math.max(0, entry.carbs - removed.carbs) * 10) / 10;
+    const nextFat = itemsCarryMacros
+      ? Math.round(remaining.reduce((acc, i) => acc + i.fat, 0) * 10) / 10
+      : Math.round(Math.max(0, entry.fat - removed.fat) * 10) / 10;
+
+    await saveMealEntry({
+      ...entry,
+      calories: nextCalories,
+      protein: nextProtein,
+      carbs: nextCarbs,
+      fat: nextFat,
+      healthScore: computeHealthScoreFromMacros(
+        nextCalories,
+        nextProtein,
+        nextCarbs,
+        nextFat
+      ),
+      items: remaining,
+    });
+    showToast(`Removed ${removed.name} · nutrition updated`);
+  };
+
+  const handleRunFix = () => {
+    const cleanPrompt = fixPrompt.trim();
+    if (!cleanPrompt) {
       showToast('Describe what to adjust (e.g. "no fries" or "200 g rice")');
       return;
     }
-    setRefining(true);
-    const ok = await refineMealEntry(entry.id, fixPrompt.trim());
-    setRefining(false);
-    if (ok) {
-      setFixPrompt('');
-      setShowFixBox(false);
-    }
+    Keyboard.dismiss();
+    setFixPrompt('');
+    setShowFixBox(false);
+    showToast('AI recalculating calories & macros in the background…');
+    void refineMealEntry(entry.id, cleanPrompt);
   };
 
   const providerCaption =
@@ -1584,8 +2097,29 @@ function NutritionDetailContent({
             </View>
           </View>
 
+          {/* Background AI Working Banner */}
+          {isRefining ? (
+            <View style={[styles.detailRefiningBanner, cardShadow]}>
+              <ActivityIndicator size="small" color="#FFFFFF" />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.detailRefiningTitle}>
+                  AI is recalculating calories & macros…
+                </Text>
+                <Text style={styles.detailRefiningSub} numberOfLines={2}>
+                  {`"${activeRefiningPrompt}" · Working in the background — you can tap Done anytime`}
+                </Text>
+              </View>
+            </View>
+          ) : null}
+
           {/* Calories Card */}
-          <View style={[styles.detailKcalCard, cardShadow]}>
+          <Animated.View
+            style={[
+              styles.detailKcalCard,
+              cardShadow,
+              isRefining ? { opacity: macroPulse } : null,
+            ]}
+          >
             <View style={styles.detailKcalBadge}>
               <PlateIcon name="flame" size={24} color={plateColors.ink} />
             </View>
@@ -1595,10 +2129,15 @@ function NutritionDetailContent({
                 {formatNum(entry.calories * servings)}
               </Text>
             </View>
-          </View>
+          </Animated.View>
 
           {/* 3 Macro Cards */}
-          <View style={styles.detailMacrosRow}>
+          <Animated.View
+            style={[
+              styles.detailMacrosRow,
+              isRefining ? { opacity: macroPulse } : null,
+            ]}
+          >
             <View style={[styles.detailMacroCard, cardShadow]}>
               <PlateIcon name="drum" size={18} color={plateColors.protein} />
               <View>
@@ -1628,7 +2167,7 @@ function NutritionDetailContent({
                 </Text>
               </View>
             </View>
-          </View>
+          </Animated.View>
 
           {/* Health Score */}
           <View style={[styles.healthCard, cardShadow]}>
@@ -1685,6 +2224,15 @@ function NutritionDetailContent({
                   <Text style={styles.ingChipKcal}>
                     {`${Math.round(item.calories * servings)} kcal`}
                   </Text>
+                  {entry.items.length > 1 ? (
+                    <Pressable
+                      onPress={() => void handleRemoveIngredient(item.id)}
+                      hitSlop={8}
+                      style={styles.ingChipRemoveBtn}
+                    >
+                      <PlateIcon name="x" size={11} color={plateColors.muted} />
+                    </Pressable>
+                  ) : null}
                 </View>
               );
             })}
@@ -1698,40 +2246,86 @@ function NutritionDetailContent({
           </View>
 
           {showAddIng ? (
-            <View style={[styles.inlineBox, cardShadow]}>
-              <TextInput
-                value={newIngName}
-                onChangeText={setNewIngName}
-                placeholder="Ingredient (e.g. Olive oil 15 mL)"
-                placeholderTextColor={plateColors.faint}
-                style={[styles.sheetInput, { flex: 1 }]}
-              />
-              <TextInput
-                value={newIngGrams}
-                onChangeText={setNewIngGrams}
-                placeholder="g"
-                placeholderTextColor={plateColors.faint}
-                keyboardType="numeric"
-                style={[styles.sheetInput, { width: 58 }]}
-              />
-              <TextInput
-                value={newIngKcal}
-                onChangeText={setNewIngKcal}
-                placeholder="kcal"
-                placeholderTextColor={plateColors.faint}
-                keyboardType="numeric"
-                style={[styles.sheetInput, { width: 66 }]}
-              />
-              <Pressable onPress={handleAddIngredient} style={styles.smallDarkBtn}>
-                <Text style={styles.smallDarkBtnText}>Add</Text>
-              </Pressable>
+            <View style={[styles.addIngCard, cardShadow]}>
+              <Text style={styles.fixBoxTitle}>
+                Add ingredient (AI auto-calculates macros, or enter values)
+              </Text>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                <TextInput
+                  value={newIngName}
+                  onChangeText={setNewIngName}
+                  placeholder='e.g. "2 boiled eggs" or "Olive oil"'
+                  placeholderTextColor={plateColors.faint}
+                  style={[styles.sheetInput, { flex: 1 }]}
+                />
+                <TextInput
+                  value={newIngGrams}
+                  onChangeText={setNewIngGrams}
+                  placeholder="g"
+                  placeholderTextColor={plateColors.faint}
+                  keyboardType="decimal-pad"
+                  style={[styles.sheetInput, { width: 62 }]}
+                />
+                <Pressable
+                  onPress={handleAddIngredientWithAI}
+                  disabled={isRefining}
+                  style={[
+                    styles.smallAiBtn,
+                    isRefining ? { opacity: 0.5 } : null,
+                  ]}
+                >
+                  <PlateIcon name="sparkle" size={13} color="#FFFFFF" />
+                  <Text style={styles.smallDarkBtnText}>AI Add</Text>
+                </Pressable>
+              </View>
+
+              <View style={{ flexDirection: 'row', gap: 6 }}>
+                <TextInput
+                  value={newIngKcal}
+                  onChangeText={setNewIngKcal}
+                  placeholder="kcal"
+                  placeholderTextColor={plateColors.faint}
+                  keyboardType="numeric"
+                  style={[styles.sheetInput, styles.macroMiniField]}
+                />
+                <TextInput
+                  value={newIngProtein}
+                  onChangeText={setNewIngProtein}
+                  placeholder="P (g)"
+                  placeholderTextColor={plateColors.faint}
+                  keyboardType="decimal-pad"
+                  style={[styles.sheetInput, styles.macroMiniField]}
+                />
+                <TextInput
+                  value={newIngCarbs}
+                  onChangeText={setNewIngCarbs}
+                  placeholder="C (g)"
+                  placeholderTextColor={plateColors.faint}
+                  keyboardType="decimal-pad"
+                  style={[styles.sheetInput, styles.macroMiniField]}
+                />
+                <TextInput
+                  value={newIngFat}
+                  onChangeText={setNewIngFat}
+                  placeholder="F (g)"
+                  placeholderTextColor={plateColors.faint}
+                  keyboardType="decimal-pad"
+                  style={[styles.sheetInput, styles.macroMiniField]}
+                />
+                <Pressable
+                  onPress={() => void handleAddIngredient()}
+                  style={styles.smallOutlineBtn}
+                >
+                  <Text style={styles.smallOutlineBtnText}>Save</Text>
+                </Pressable>
+              </View>
             </View>
           ) : null}
 
           {showFixBox ? (
             <View style={[styles.fixBox, cardShadow]}>
               <Text style={styles.fixBoxTitle}>
-                Refine with AI (describe g, mL, or changes)
+                Refine with AI (updates calories & macros in the background)
               </Text>
               <View style={{ flexDirection: 'row', gap: 8 }}>
                 <TextInput
@@ -1739,18 +2333,19 @@ function NutritionDetailContent({
                   onChangeText={setFixPrompt}
                   placeholder='e.g. "no fries, 200 g beef patty, 15 mL sauce"'
                   placeholderTextColor={plateColors.faint}
+                  returnKeyType="go"
+                  onSubmitEditing={handleRunFix}
                   style={[styles.sheetInput, { flex: 1 }]}
                 />
                 <Pressable
                   onPress={handleRunFix}
-                  disabled={refining}
-                  style={styles.smallDarkBtn}
+                  disabled={isRefining}
+                  style={[
+                    styles.smallDarkBtn,
+                    isRefining ? { opacity: 0.55 } : null,
+                  ]}
                 >
-                  {refining ? (
-                    <ActivityIndicator size="small" color="#FFFFFF" />
-                  ) : (
-                    <Text style={styles.smallDarkBtnText}>Apply</Text>
-                  )}
+                  <Text style={styles.smallDarkBtnText}>Apply</Text>
                 </Pressable>
               </View>
             </View>
@@ -1768,8 +2363,14 @@ function NutritionDetailContent({
           onPress={() => setShowFixBox((v) => !v)}
           style={styles.btnLine}
         >
-          <PlateIcon name="sparkle" size={18} color={plateColors.ink} />
-          <Text style={styles.btnLineText}>Fix results</Text>
+          {isRefining ? (
+            <ActivityIndicator size="small" color={plateColors.ink} />
+          ) : (
+            <PlateIcon name="sparkle" size={18} color={plateColors.ink} />
+          )}
+          <Text style={styles.btnLineText}>
+            {isRefining ? 'AI updating…' : 'Fix results'}
+          </Text>
         </Pressable>
 
         <Pressable onPress={onClose} style={styles.btnDark}>
@@ -1875,7 +2476,7 @@ export function PlateOverlays({
         />
       ) : null}
 
-      {/* 2×2 Quick Actions Grid */}
+      {/* Quick Actions Menu */}
       {quickOpen ? (
         <View style={styles.quickGrid}>
           <Pressable
@@ -1883,16 +2484,32 @@ export function PlateOverlays({
               setQuickOpen(false);
               setScannerOpen(true);
             }}
-            style={[styles.qaCard, styles.qaCardPrimary, cardShadow]}
+            style={[styles.qaCardWide, styles.qaCardPrimary, cardShadow]}
           >
-            <PlateIcon name="scan" size={26} color="#FFFFFF" />
-            <View>
+            <View style={styles.qaWideIconWrap}>
+              <PlateIcon name="scan" size={24} color="#FFFFFF" />
+            </View>
+            <View style={{ flex: 1 }}>
               <Text style={[styles.qaTitle, { color: '#FFFFFF' }]}>
-                Scan food
+                Scan food or barcode
               </Text>
               <Text style={styles.qaSubPrimary}>
-                Snap a photo, AI does the rest
+                Snap a meal, barcode, or ask AI custom portions
               </Text>
+            </View>
+          </Pressable>
+
+          <Pressable
+            onPress={() => {
+              setQuickOpen(false);
+              onChangeSheet('water');
+            }}
+            style={[styles.qaCard, cardShadow]}
+          >
+            <PlateIcon name="drop" size={25} color={plateColors.fat} />
+            <View>
+              <Text style={styles.qaTitle}>Log water</Text>
+              <Text style={styles.qaSub}>+250 mL, bottle, custom</Text>
             </View>
           </Pressable>
 
@@ -1903,7 +2520,7 @@ export function PlateOverlays({
             }}
             style={[styles.qaCard, cardShadow]}
           >
-            <PlateIcon name="dumbbell" size={26} color={plateColors.ink} />
+            <PlateIcon name="dumbbell" size={25} color={plateColors.ink} />
             <View>
               <Text style={styles.qaTitle}>Log exercise</Text>
               <Text style={styles.qaSub}>Run, lift, walk</Text>
@@ -1917,7 +2534,7 @@ export function PlateOverlays({
             }}
             style={[styles.qaCard, cardShadow]}
           >
-            <PlateIcon name="bookmark" size={26} color={plateColors.ink} />
+            <PlateIcon name="bookmark" size={25} color={plateColors.ink} />
             <View>
               <Text style={styles.qaTitle}>Saved foods</Text>
               <Text style={styles.qaSub}>Your go-to meals</Text>
@@ -1931,7 +2548,7 @@ export function PlateOverlays({
             }}
             style={[styles.qaCard, cardShadow]}
           >
-            <PlateIcon name="search" size={26} color={plateColors.ink} />
+            <PlateIcon name="search" size={25} color={plateColors.ink} />
             <View>
               <Text style={styles.qaTitle}>Food database</Text>
               <Text style={styles.qaSub}>Search & add</Text>
@@ -2022,6 +2639,12 @@ export function PlateOverlays({
                 {activeSheet === 'steps' ? (
                   <StepsSheetBody
                     key={selectedDateKey}
+                    onClose={() => onChangeSheet(null)}
+                  />
+                ) : null}
+                {activeSheet === 'water' ? (
+                  <WaterSheetBody
+                    key={`water_${selectedDateKey}`}
                     onClose={() => onChangeSheet(null)}
                   />
                 ) : null}
@@ -2261,11 +2884,29 @@ const styles = StyleSheet.create({
   qaCard: {
     width: '48%',
     flexGrow: 1,
-    height: 116,
+    height: 102,
     borderRadius: 24,
     backgroundColor: plateColors.card,
-    padding: 17,
+    padding: 15,
     justifyContent: 'space-between',
+  },
+  qaCardWide: {
+    width: '100%',
+    borderRadius: 24,
+    backgroundColor: plateColors.ink,
+    paddingVertical: 15,
+    paddingHorizontal: 17,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 13,
+  },
+  qaWideIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 15,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   qaCardPrimary: {
     backgroundColor: plateColors.ink,
@@ -3403,5 +4044,214 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
     color: plateColors.ink,
+  },
+  waterSheetTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  waterResetChip: {
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 99,
+    backgroundColor: plateColors.chip,
+  },
+  waterResetChipText: {
+    fontSize: 12.5,
+    fontWeight: '600',
+    color: plateColors.ink2,
+  },
+  waterSheetProgressTrack: {
+    height: 9,
+    borderRadius: 99,
+    backgroundColor: plateColors.chip,
+    overflow: 'hidden',
+  },
+  waterSheetProgressFill: {
+    height: '100%',
+    borderRadius: 99,
+    backgroundColor: plateColors.fat,
+  },
+  waterPresetGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  waterPresetBtn: {
+    flexGrow: 1,
+    minWidth: '30%',
+    backgroundColor: plateColors.bg,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+    borderRadius: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    alignItems: 'center',
+    gap: 2,
+  },
+  waterPresetBtnLabel: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
+  },
+  waterPresetBtnSub: {
+    fontSize: 11.5,
+    fontWeight: '500',
+    color: plateColors.muted,
+  },
+  barcodeResultScroll: {
+    width: '100%',
+    maxWidth: 356,
+    maxHeight: 420,
+    flexGrow: 0,
+  },
+  barcodeResultScrollContent: {
+    paddingVertical: 2,
+  },
+  barcodeAiBox: {
+    backgroundColor: plateColors.bg,
+    borderRadius: 16,
+    padding: 11,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: plateColors.line,
+  },
+  barcodeAiHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  barcodeAiTitleWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    flex: 1,
+  },
+  barcodeAiTitle: {
+    fontSize: 12.5,
+    fontWeight: '700',
+    color: plateColors.ink,
+  },
+  barcodeAiResetLink: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: plateColors.fat,
+  },
+  barcodeAiAppliedText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.ok,
+  },
+  barcodeAiWorkingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 11,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  barcodeAiWorkingText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: plateColors.ink,
+  },
+  barcodeAiInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  barcodeAiInput: {
+    flex: 1,
+    height: 38,
+    borderRadius: 11,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: plateColors.line,
+    paddingHorizontal: 10,
+    fontSize: 13,
+    color: plateColors.ink,
+  },
+  barcodeAiCalcBtn: {
+    height: 38,
+    paddingHorizontal: 12,
+    borderRadius: 11,
+    backgroundColor: plateColors.ink,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  barcodeAiCalcBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  detailRefiningBanner: {
+    backgroundColor: plateColors.ink,
+    borderRadius: 20,
+    paddingHorizontal: 15,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 11,
+  },
+  detailRefiningTitle: {
+    color: '#FFFFFF',
+    fontSize: 13.5,
+    fontWeight: '700',
+  },
+  detailRefiningSub: {
+    color: 'rgba(255,255,255,0.74)',
+    fontSize: 12,
+    fontWeight: '500',
+    marginTop: 2,
+    lineHeight: 16,
+  },
+  ingChipRemoveBtn: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 2,
+  },
+  addIngCard: {
+    backgroundColor: '#FFFFFF',
+    padding: 12,
+    borderRadius: 20,
+    gap: 8,
+  },
+  smallAiBtn: {
+    height: 44,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: plateColors.ink,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 5,
+  },
+  macroMiniField: {
+    flex: 1,
+    paddingHorizontal: 8,
+    textAlign: 'center',
+    fontSize: 13,
+    fontVariant: ['tabular-nums'],
+  },
+  smallOutlineBtn: {
+    height: 44,
+    paddingHorizontal: 13,
+    borderRadius: 14,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  smallOutlineBtnText: {
+    color: plateColors.ink,
+    fontSize: 13.5,
+    fontWeight: '700',
   },
 });

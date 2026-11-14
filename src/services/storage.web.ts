@@ -43,6 +43,7 @@ const WEB_AUTH_PREFS_KEY = 'plate_auth_prefs_v2';
 const WEB_AUTH_SECRETS_SESSION_KEY = 'plate_auth_secrets_v2';
 const WEB_AI_LOGS_SESSION_KEY = 'plate_ai_diagnostic_logs_v1';
 const WEB_ONBOARDING_KEY = 'calorielens_onboarded_v1';
+const WEB_AI_DISCLAIMER_SEEN_KEY = 'plate_ai_disclaimer_seen_v1';
 const WEB_PROFILE_KEY = 'plate_profile_v1';
 const LEGACY_WEB_PROFILE_KEY = 'calorielens_profile_v1';
 const WEB_PREFS_KEY = 'plate_prefs_v1';
@@ -513,6 +514,27 @@ export async function saveOnboardingCompleted(
     globalThis.localStorage?.setItem(
       WEB_ONBOARDING_KEY,
       completed ? 'true' : 'false'
+    );
+  } catch {
+    // ignore
+  }
+}
+
+export async function loadAIDisclaimerSeen(): Promise<boolean> {
+  try {
+    return (
+      globalThis.localStorage?.getItem(WEB_AI_DISCLAIMER_SEEN_KEY) === 'true'
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function saveAIDisclaimerSeen(seen: boolean): Promise<void> {
+  try {
+    globalThis.localStorage?.setItem(
+      WEB_AI_DISCLAIMER_SEEN_KEY,
+      seen ? 'true' : 'false'
     );
   } catch {
     // ignore

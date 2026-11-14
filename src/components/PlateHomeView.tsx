@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Animated,
   Image,
   LayoutChangeEvent,
@@ -16,8 +17,10 @@ import {
   formatMetersMetric,
   formatNum,
   formatWaterLiters,
+  mlToWaterSteps,
   resolveMealImageSource,
   WATER_STEP_ML,
+  waterStepsToMl,
 } from '../constants/plateCatalog';
 import { useCalorieTracker } from '../context/CalorieContext';
 import { isProviderConfigured } from '../services/ai';
@@ -53,6 +56,7 @@ function getPendingStageLabel(progress: number = 0): string {
 
 interface PlateHomeViewProps {
   onOpenStepsSheet: () => void;
+  onOpenWaterSheet: () => void;
   onSelectExercise: (entry: MealEntry) => void;
 }
 
@@ -128,6 +132,7 @@ function PendingMealCard({ entry }: { entry: MealEntry }) {
 
 export function PlateHomeView({
   onOpenStepsSheet,
+  onOpenWaterSheet,
   onSelectExercise,
 }: PlateHomeViewProps) {
   const {
@@ -142,13 +147,15 @@ export function PlateHomeView({
     preferences,
     updatePreferences,
     waterByDate,
-    setWaterForDate,
+    addWaterMl,
     stepsByDate,
     auth,
     companionStatus,
     setActiveTab,
     setDetailEntryId,
     setScannerOpen,
+    refiningByEntryId,
+    showToast,
   } = useCalorieTracker();
 
   const isDesktopStage = useIsDesktopStage();
@@ -219,8 +226,21 @@ export function PlateHomeView({
 
   const steps = stepsByDate[selectedDateKey] ?? 0;
   const water = waterByDate[selectedDateKey] ?? 0;
+  const waterMl = waterStepsToMl(water);
+  const waterGoalMl = Math.max(250, waterStepsToMl(goals.waterGlasses));
+  const waterPct = Math.min(1, waterMl / waterGoalMl);
   const stepKcal = Math.round(steps * 0.04);
   const stepMeters = estimateStepMeters(steps, profile.heightCm);
+  const activeRefiningCount = Object.keys(refiningByEntryId).length;
+
+  const handleQuickAddWater = async (deltaMl: number) => {
+    const nextMl = await addWaterMl(deltaMl, selectedDateKey);
+    if (deltaMl > 0) {
+      showToast(
+        `+${deltaMl} mL water · ${formatWaterLiters(mlToWaterSteps(nextMl))} today`
+      );
+    }
+  };
 
   const handleCarouselLayout = (e: LayoutChangeEvent) => {
     const w = Math.round(e.nativeEvent.layout.width);
@@ -576,38 +596,58 @@ export function PlateHomeView({
             </View>
 
             <View style={[styles.waterCard, cardShadow]}>
-              <View style={styles.chipBadge}>
-                <PlateIcon name="drop" size={18} color={plateColors.fat} />
-              </View>
-
-              <View style={{ flex: 1 }}>
-                <Text style={styles.waterVal}>{formatWaterLiters(water)}</Text>
-                <Text style={styles.waterSub}>
-                  {`Water · ${water * WATER_STEP_ML} mL / ${formatWaterLiters(
-                    goals.waterGlasses
-                  )}`}
-                </Text>
-                <View style={styles.glassesRow}>
-                  {Array.from(
-                    { length: Math.min(12, Math.max(1, goals.waterGlasses)) },
-                    (_, idx) => {
-                      const filled = idx < water;
-                      return (
-                        <View key={idx} style={styles.glassCup}>
-                          {filled ? <View style={styles.glassFill} /> : null}
-                        </View>
-                      );
-                    }
-                  )}
+              <Pressable
+                onPress={onOpenWaterSheet}
+                style={styles.waterTapBody}
+              >
+                <View style={styles.chipBadge}>
+                  <PlateIcon name="drop" size={18} color={plateColors.fat} />
                 </View>
-              </View>
+
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.waterVal}>{formatWaterLiters(water)}</Text>
+                  <Text style={styles.waterSub}>
+                    {`Water · ${formatNum(waterMl)} mL / ${formatWaterLiters(
+                      goals.waterGlasses
+                    )}`}
+                  </Text>
+                  <View style={styles.glassesRow}>
+                    {Array.from(
+                      { length: Math.min(12, Math.max(1, goals.waterGlasses)) },
+                      (_, idx) => {
+                        const filled = idx + 0.01 <= water;
+                        const partial = !filled && idx < water;
+                        return (
+                          <View key={idx} style={styles.glassCup}>
+                            {filled ? (
+                              <View style={styles.glassFill} />
+                            ) : partial ? (
+                              <View
+                                style={[
+                                  styles.glassFill,
+                                  {
+                                    height: Math.max(
+                                      4,
+                                      Math.round((water - idx) * 14)
+                                    ),
+                                  },
+                                ]}
+                              />
+                            ) : null}
+                          </View>
+                        );
+                      }
+                    )}
+                  </View>
+                </View>
+              </Pressable>
 
               <Pressable
-                onPress={() =>
-                  setWaterForDate(selectedDateKey, Math.max(0, water - 1))
-                }
+                onPress={() => void handleQuickAddWater(-WATER_STEP_ML)}
+                disabled={waterMl <= 0}
                 style={({ pressed }) => [
                   styles.roundBtn,
+                  waterMl <= 0 ? { opacity: 0.35 } : null,
                   pressed ? { transform: [{ scale: 0.9 }] } : null,
                 ]}
               >
@@ -615,12 +655,7 @@ export function PlateHomeView({
               </Pressable>
 
               <Pressable
-                onPress={() =>
-                  setWaterForDate(
-                    selectedDateKey,
-                    Math.min(goals.waterGlasses + 4, water + 1)
-                  )
-                }
+                onPress={() => void handleQuickAddWater(WATER_STEP_ML)}
                 style={({ pressed }) => [
                   styles.roundBtn,
                   styles.roundBtnDark,
@@ -648,6 +683,84 @@ export function PlateHomeView({
           );
         })}
       </View>
+
+      {/* Always-Visible Hydration Quick Bar */}
+      <View style={[styles.waterQuickCard, cardShadow]}>
+        <Pressable
+          onPress={onOpenWaterSheet}
+          style={({ pressed }) => [
+            styles.waterQuickTapArea,
+            pressed ? { opacity: 0.8 } : null,
+          ]}
+        >
+          <View style={styles.waterQuickIconWrap}>
+            <PlateIcon name="drop" size={18} color={plateColors.fat} />
+          </View>
+          <View style={{ flex: 1, gap: 5 }}>
+            <View style={styles.waterQuickHeaderRow}>
+              <Text style={styles.waterQuickTitle}>Water</Text>
+              <Text style={styles.waterQuickAmount}>
+                {`${formatWaterLiters(water)} `}
+                <Text style={styles.waterQuickGoalText}>
+                  {`/ ${formatWaterLiters(goals.waterGlasses)} (${formatNum(
+                    waterMl
+                  )} mL)`}
+                </Text>
+              </Text>
+            </View>
+            <View style={styles.waterQuickProgressTrack}>
+              <View
+                style={[
+                  styles.waterQuickProgressFill,
+                  { width: `${Math.round(waterPct * 100)}%` },
+                ]}
+              />
+            </View>
+          </View>
+        </Pressable>
+
+        <View style={styles.waterQuickActions}>
+          <Pressable
+            onPress={() => void handleQuickAddWater(-WATER_STEP_ML)}
+            disabled={waterMl <= 0}
+            hitSlop={6}
+            style={({ pressed }) => [
+              styles.waterQuickMinusBtn,
+              waterMl <= 0 ? { opacity: 0.35 } : null,
+              pressed ? { transform: [{ scale: 0.92 }] } : null,
+            ]}
+          >
+            <PlateIcon name="minus" size={15} color={plateColors.ink} />
+          </Pressable>
+
+          <Pressable
+            onPress={() => void handleQuickAddWater(WATER_STEP_ML)}
+            hitSlop={6}
+            style={({ pressed }) => [
+              styles.waterQuickAddPill,
+              pressed ? { transform: [{ scale: 0.94 }] } : null,
+            ]}
+          >
+            <PlateIcon name="plus" size={13} color="#FFFFFF" />
+            <Text style={styles.waterQuickAddPillText}>250 mL</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      {/* Background AI Working Indicator */}
+      {activeRefiningCount > 0 ? (
+        <View style={[styles.refiningBanner, cardShadow]}>
+          <ActivityIndicator size="small" color="#FFFFFF" />
+          <View style={{ flex: 1 }}>
+            <Text style={styles.refiningBannerTitle}>
+              AI is recalculating nutrition in the background…
+            </Text>
+            <Text style={styles.refiningBannerSub}>
+              Calories and macros will update automatically when ready
+            </Text>
+          </View>
+        </View>
+      ) : null}
 
       {/* Recently Logged */}
       <View style={styles.sectionHead}>
@@ -735,6 +848,7 @@ export function PlateHomeView({
 
             const mult = entry.servings ?? 1;
             const imgSrc = resolveMealImageSource(entry);
+            const isRefiningThis = Boolean(refiningByEntryId[entry.id]);
 
             return (
               <Pressable
@@ -743,6 +857,7 @@ export function PlateHomeView({
                 style={({ pressed }) => [
                   styles.logCard,
                   cardShadow,
+                  isRefiningThis ? styles.logCardRefining : null,
                   pressed ? { transform: [{ scale: 0.985 }] } : null,
                 ]}
               >
@@ -762,6 +877,11 @@ export function PlateHomeView({
                       />
                     </View>
                   )}
+                  {isRefiningThis ? (
+                    <View style={styles.pendingScrim}>
+                      <ActivityIndicator size="small" color="#FFFFFF" />
+                    </View>
+                  ) : null}
                 </View>
 
                 <View style={styles.logBody}>
@@ -776,6 +896,19 @@ export function PlateHomeView({
                       </Text>
                     </View>
                   </View>
+
+                  {isRefiningThis ? (
+                    <View style={styles.cardRefiningPill}>
+                      <PlateIcon
+                        name="sparkle"
+                        size={12}
+                        color={plateColors.ink}
+                      />
+                      <Text style={styles.cardRefiningPillText} numberOfLines={1}>
+                        AI updating calories & macros…
+                      </Text>
+                    </View>
+                  ) : null}
 
                   <View style={styles.logKcalRow}>
                     <PlateIcon name="flame" size={16} color={plateColors.ink} />
@@ -1133,8 +1266,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     gap: 6,
-    marginTop: 14,
-    marginBottom: 20,
+    marginTop: 12,
+    marginBottom: 14,
   },
   dot: {
     width: 6,
@@ -1145,6 +1278,137 @@ const styles = StyleSheet.create({
   dotActive: {
     width: 18,
     backgroundColor: plateColors.ink,
+  },
+  waterTapBody: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  waterQuickCard: {
+    backgroundColor: plateColors.card,
+    borderRadius: 22,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 18,
+  },
+  waterQuickTapArea: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  waterQuickIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: '#EAF4FF',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  waterQuickHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 6,
+  },
+  waterQuickTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: plateColors.ink,
+  },
+  waterQuickAmount: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: plateColors.ink,
+    fontVariant: ['tabular-nums'],
+  },
+  waterQuickGoalText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: plateColors.muted,
+  },
+  waterQuickProgressTrack: {
+    height: 6,
+    borderRadius: 99,
+    backgroundColor: plateColors.chip,
+    overflow: 'hidden',
+  },
+  waterQuickProgressFill: {
+    height: '100%',
+    borderRadius: 99,
+    backgroundColor: plateColors.fat,
+  },
+  waterQuickActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  waterQuickMinusBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: plateColors.chip,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  waterQuickAddPill: {
+    height: 32,
+    paddingHorizontal: 10,
+    borderRadius: 99,
+    backgroundColor: plateColors.ink,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  waterQuickAddPillText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
+  refiningBanner: {
+    backgroundColor: plateColors.ink,
+    borderRadius: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 14,
+  },
+  refiningBannerTitle: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  refiningBannerSub: {
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 11.5,
+    fontWeight: '500',
+    marginTop: 1,
+  },
+  logCardRefining: {
+    borderWidth: 1.5,
+    borderColor: plateColors.ink,
+  },
+  cardRefiningPill: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#EEF4FF',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  cardRefiningPillText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: plateColors.ink,
   },
   sectionHead: {
     flexDirection: 'row',

@@ -49,6 +49,7 @@ export default function MainPlateScreen() {
         {activeTab === 'home' ? (
           <PlateHomeView
             onOpenStepsSheet={() => setActiveSheet('steps')}
+            onOpenWaterSheet={() => setActiveSheet('water')}
             onSelectExercise={(entry) => {
               setSelectedExercise(entry);
               setActiveSheet('exerciseDetail');
