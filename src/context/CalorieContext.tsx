@@ -16,6 +16,7 @@ import {
   analyzeMealWithAI,
   checkCompanionStatus,
   isProviderConfigured,
+  resolveReadyProvider,
 } from '../services/ai';
 import { assetToBase64, persistMealPhotoUri } from '../services/photos';
 import {
@@ -488,13 +489,18 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      const providerState = isProviderConfigured(
+      const effectiveProvider = resolveReadyProvider(
         auth.activeProvider,
         auth,
         companionStatus
       );
+      const providerState = isProviderConfigured(
+        effectiveProvider,
+        auth,
+        companionStatus
+      );
       if (!providerState.ready) {
-        showToast(`Connect ${auth.activeProvider.toUpperCase()} in Settings first`);
+        showToast('Sign in to an AI provider in Settings first');
         setActiveTab('settings');
         return;
       }
@@ -543,7 +549,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const aiResult = await analyzeMealWithAI({
-          provider: auth.activeProvider,
+          provider: effectiveProvider,
           auth,
           imageBase64: b64,
           mimeType: mime,
@@ -607,14 +613,19 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
       const target = meals.find((m) => m.id === entryId);
       if (!target || !instruction.trim()) return false;
 
-      const providerState = isProviderConfigured(
+      const effectiveProvider = resolveReadyProvider(
         auth.activeProvider,
+        auth,
+        companionStatus
+      );
+      const providerState = isProviderConfigured(
+        effectiveProvider,
         auth,
         companionStatus
       );
 
       if (!providerState.ready) {
-        showToast('Authorize an AI provider in Settings to refine with AI');
+        showToast('Sign in to an AI provider in Settings to refine with AI');
         return false;
       }
 
@@ -639,7 +650,7 @@ export function CalorieProvider({ children }: { children: React.ReactNode }) {
         }
 
         const aiResult = await analyzeMealWithAI({
-          provider: auth.activeProvider,
+          provider: effectiveProvider,
           auth,
           imageBase64: b64,
           mimeType: mime,

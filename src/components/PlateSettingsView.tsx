@@ -14,21 +14,28 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { formatNum } from '../constants/plateCatalog';
+import {
+  estimateStepMeters,
+  formatHeightMetric,
+  formatMetersMetric,
+  formatNum,
+  formatWaterLiters,
+} from '../constants/plateCatalog';
 import { getAppVersionMetadata } from '../constants/version';
 import { useCalorieTracker } from '../context/CalorieContext';
 import {
   cancelPendingChatGPTSignIn,
   completeOnDeviceChatGPTCallback,
+  detectApiKeyProvider,
   disconnectChatGPTOAuth,
   disconnectGoogleOAuth,
   isProviderConfigured,
   looksLikeOAuthCallbackInput,
-  openProviderWebsite,
-  PROVIDER_AUTH_PORTALS,
+  openProviderPortalForKey,
   signInWithGoogleOAuth,
   startChatGPTDeviceCodeSignIn,
   startChatGPTSignIn,
+  testAIProviderConnection,
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { AIProviderId, UserGoals } from '../types/models';
@@ -72,6 +79,7 @@ export function PlateSettingsView({
   const [companionUrlDraft, setCompanionUrlDraft] = useState<string | null>(
     null
   );
+  const [testingAi, setTestingAi] = useState(false);
   const [clearTapCount, setClearTapCount] = useState(0);
   const [clearedPopupOpen, setClearedPopupOpen] = useState(false);
   const clearTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -140,8 +148,32 @@ export function PlateSettingsView({
   };
 
   const handleOpenOfficialSite = async (provider: AIProviderId) => {
-    await openProviderWebsite(PROVIDER_AUTH_PORTALS[provider]);
-    showToast('Opened official portal — copy key & tap Paste');
+    const capturedKey = await openProviderPortalForKey(provider);
+    if (capturedKey) {
+      if (provider === 'antigravity') {
+        await updateAuth({
+          geminiApiKey: capturedKey,
+          activeProvider: 'antigravity',
+        });
+        showToast('Google AI key connected automatically!');
+      } else if (provider === 'claude') {
+        await updateAuth({
+          claudeApiKey: capturedKey,
+          activeProvider: 'claude',
+        });
+        showToast('Claude key connected automatically!');
+      } else {
+        await updateAuth({
+          openaiApiKey: capturedKey,
+          activeProvider: 'gpt',
+        });
+        showToast('OpenAI key connected automatically!');
+      }
+      return;
+    }
+    if (Platform.OS === 'web') {
+      showToast('Opened official portal — copy key & tap Paste');
+    }
   };
 
   const handlePasteKey = async (target: AIProviderId) => {
@@ -151,13 +183,7 @@ export function PlateSettingsView({
         showToast('Clipboard is empty');
         return;
       }
-      if (target === 'antigravity') {
-        await updateAuth({ geminiApiKey: clip, activeProvider: 'antigravity' });
-        showToast('Google AI key saved');
-      } else if (target === 'claude') {
-        await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
-        showToast('Claude key saved');
-      } else if (looksLikeOAuthCallbackInput(clip)) {
+      if (looksLikeOAuthCallbackInput(clip)) {
         const session = await completeOnDeviceChatGPTCallback(clip, auth);
         await updateAuth({
           activeProvider: 'gpt',
@@ -170,6 +196,15 @@ export function PlateSettingsView({
             ? `Connected (${session.email})`
             : 'ChatGPT SSO connected'
         );
+        return;
+      }
+      const detected = detectApiKeyProvider(clip) || target;
+      if (detected === 'antigravity') {
+        await updateAuth({ geminiApiKey: clip, activeProvider: 'antigravity' });
+        showToast('Google AI key saved');
+      } else if (detected === 'claude') {
+        await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
+        showToast('Claude key saved');
       } else {
         await updateAuth({ openaiApiKey: clip, activeProvider: 'gpt' });
         showToast('OpenAI key saved');
@@ -181,14 +216,31 @@ export function PlateSettingsView({
     }
   };
 
+  const handleTestAi = async () => {
+    setTestingAi(true);
+    try {
+      const res = await testAIProviderConnection(auth, activeProvider);
+      showToast(
+        `✓ AI ready (${res.modelUsed || colors.providers[res.providerUsed].label})`
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'AI connection failed');
+    } finally {
+      setTestingAi(false);
+    }
+  };
+
   const handleChatGPTSignIn = async () => {
     setOauthBusy(true);
     try {
-      const res = await startChatGPTSignIn(auth);
+      const res = await startChatGPTSignIn(auth, 'codex');
       if (res.mode === 'on_device_connected') {
         await updateAuth({
           activeProvider: 'gpt',
           chatgptOAuth: res.session,
+          ...(!res.session.accessToken && res.apiKeyIssued
+            ? { openaiApiKey: res.apiKeyIssued }
+            : {}),
         });
         setAwaitingGptCallback(false);
         setCallbackUrlDraft('');
@@ -211,7 +263,7 @@ export function PlateSettingsView({
         );
       } else {
         setAwaitingGptCallback(true);
-        showToast('Approve in Safari, copy 127.0.0.1 URL & tap Complete');
+        showToast('Approve in browser, copy localhost URL & tap Complete');
       }
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Sign-in cancelled');
@@ -270,7 +322,9 @@ export function PlateSettingsView({
       await updateAuth({
         activeProvider: 'gpt',
         chatgptOAuth: res.session,
-        ...(res.apiKeyIssued ? { openaiApiKey: res.apiKeyIssued } : {}),
+        ...(!res.session.accessToken && res.apiKeyIssued
+          ? { openaiApiKey: res.apiKeyIssued }
+          : {}),
       });
       setDeviceCodeInfo(null);
       setAwaitingGptCallback(false);
@@ -316,7 +370,8 @@ export function PlateSettingsView({
     step: number,
     dotColor?: string,
     isLast?: boolean,
-    minVal: number = 0
+    minVal: number = 0,
+    formattedValue?: string
   ) => (
     <View
       key={field}
@@ -329,7 +384,9 @@ export function PlateSettingsView({
         <Text style={styles.srowLabel}>{label}</Text>
       </View>
 
-      <Text style={styles.srowVal}>{`${formatNum(goals[field])}${unit}`}</Text>
+      <Text style={styles.srowVal}>
+        {formattedValue ?? `${formatNum(goals[field])}${unit}`}
+      </Text>
 
       <View style={styles.miniStepWrap}>
         <Pressable
@@ -409,9 +466,9 @@ export function PlateSettingsView({
         <View style={{ flex: 1 }}>
           <Text style={styles.profileName}>{profile.name}</Text>
           <Text style={styles.profileSub}>
-            {`${profile.heightCm} cm · ${profile.weightKg.toFixed(1)} kg · goal ${
-              profile.goalWeightKg
-            } kg`}
+            {`${formatHeightMetric(profile.heightCm)} · ${profile.weightKg.toFixed(
+              1
+            )} kg · goal ${profile.goalWeightKg} kg`}
           </Text>
         </View>
 
@@ -426,7 +483,7 @@ export function PlateSettingsView({
         {renderGoalRow(
           'dailyCalories',
           'Calories',
-          '',
+          ' kcal',
           50,
           plateColors.ink,
           false,
@@ -435,7 +492,7 @@ export function PlateSettingsView({
         {renderGoalRow(
           'proteinGrams',
           'Protein',
-          'g',
+          ' g',
           5,
           plateColors.protein,
           false,
@@ -444,7 +501,7 @@ export function PlateSettingsView({
         {renderGoalRow(
           'carbsGrams',
           'Carbs',
-          'g',
+          ' g',
           5,
           plateColors.carbs,
           false,
@@ -453,21 +510,33 @@ export function PlateSettingsView({
         {renderGoalRow(
           'fatGrams',
           'Fats',
-          'g',
+          ' g',
           5,
           plateColors.fat,
           false,
           10
         )}
-        {renderGoalRow('dailySteps', 'Steps', '', 500, undefined, false, 1000)}
+        {renderGoalRow(
+          'dailySteps',
+          'Steps',
+          '',
+          500,
+          undefined,
+          false,
+          1000,
+          `${formatNum(goals.dailySteps)} (${formatMetersMetric(
+            estimateStepMeters(goals.dailySteps, profile.heightCm)
+          )})`
+        )}
         {renderGoalRow(
           'waterGlasses',
           'Water',
-          ' gl',
+          '',
           1,
           undefined,
           true,
-          1
+          1,
+          formatWaterLiters(goals.waterGlasses)
         )}
       </View>
 
@@ -792,6 +861,21 @@ export function PlateSettingsView({
               </Pressable>
             </View>
           </View>
+        ) : null}
+
+        {providerStatus.ready ? (
+          <Pressable
+            onPress={handleTestAi}
+            disabled={testingAi}
+            style={[styles.secondaryAuthBtn, { marginTop: 10 }]}
+          >
+            {testingAi ? (
+              <ActivityIndicator size="small" color={plateColors.ink} />
+            ) : null}
+            <Text style={styles.secondaryAuthBtnText}>
+              {testingAi ? 'Testing AI connection…' : 'Verify AI connection'}
+            </Text>
+          </Pressable>
         ) : null}
 
         <Pressable

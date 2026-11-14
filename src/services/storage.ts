@@ -26,6 +26,7 @@ export interface PendingChatGPTPkceFlow {
   redirectUri: string;
   clientIdSent: string;
   extAgentHostId: string;
+  oauthVariant?: 'siwc' | 'codex';
   createdAt: number;
 }
 
@@ -637,28 +638,94 @@ export async function saveHasPurgedLegacyDemoSeed(
   );
 }
 
-async function getSecret(key: string): Promise<string> {
+function isMirrorKey(key: string): boolean {
+  return key.startsWith(SECURE_KEYS.settingsMirror);
+}
+
+async function getFallbackSecret(key: string): Promise<string> {
+  if (isMirrorKey(key)) return '';
   try {
-    return (await SecureStore.getItemAsync(key)) || '';
+    const db = await getDb();
+    const row = await db.getFirstAsync<{ value: string }>(
+      'SELECT value FROM app_settings WHERE key = ?',
+      [`sec_fb_${key}`]
+    );
+    if (row?.value) return row.value;
+  } catch {
+    // ignore sqlite fallback read error
+  }
+  try {
+    const docMap = await readDocumentMirrorFile();
+    return docMap[`sec_fb_${key}`] || '';
   } catch {
     return '';
   }
 }
 
+async function setFallbackSecret(key: string, value: string): Promise<void> {
+  if (isMirrorKey(key)) return;
+  const fbKey = `sec_fb_${key}`;
+  try {
+    const db = await getDb();
+    if (!value) {
+      await db.runAsync('DELETE FROM app_settings WHERE key = ?', [fbKey]);
+    } else {
+      await db.runAsync(
+        'INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)',
+        [fbKey, value]
+      );
+    }
+  } catch {
+    // ignore sqlite fallback write error
+  }
+  try {
+    const docMap = await readDocumentMirrorFile();
+    if (!value) {
+      if (fbKey in docMap) {
+        delete docMap[fbKey];
+        await writeDocumentMirrorFile(docMap);
+      }
+    } else if (docMap[fbKey] !== value) {
+      docMap[fbKey] = value;
+      await writeDocumentMirrorFile(docMap);
+    }
+  } catch {
+    // ignore document mirror fallback error
+  }
+}
+
+async function getSecret(key: string): Promise<string> {
+  try {
+    const val = await SecureStore.getItemAsync(key);
+    if (val) return val;
+  } catch {
+    // fall through to sandbox fallback (e.g. unsigned/sideloaded IPA keychain entitlement restrictions)
+  }
+  return getFallbackSecret(key);
+}
+
 async function setSecret(key: string, value: string): Promise<void> {
+  let storedInKeychain = false;
   try {
     if (!value) {
       await SecureStore.deleteItemAsync(key);
+      storedInKeychain = true;
     } else {
       await SecureStore.setItemAsync(key, value);
+      const readBack = await SecureStore.getItemAsync(key);
+      storedInKeychain = readBack === value;
     }
   } catch {
-    // ignore keychain errors in restricted environments
+    storedInKeychain = false;
+  }
+
+  if (!value || !storedInKeychain || Platform.OS !== 'web') {
+    await setFallbackSecret(key, value);
   }
 }
 
 const CHUNK_SIZE = 1600;
-const MAX_CHUNKS = 4;
+const MAX_CHUNKS = 8;
 
 async function getChunkedSecret(baseKey: string): Promise<string> {
   const parts: string[] = [];
@@ -728,6 +795,8 @@ export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
           scope: meta?.scope,
           email: meta?.email,
           name: meta?.name,
+          chatgptAccountId: meta?.chatgptAccountId,
+          oauthMode: meta?.oauthMode,
         }
       : undefined;
 
@@ -737,7 +806,9 @@ export async function loadAuthConfig(): Promise<ProviderAuthConfig> {
       ? 'gpt'
       : claudeApiKey
         ? 'claude'
-        : defaults.activeProvider);
+        : geminiApiKey
+          ? 'antigravity'
+          : defaults.activeProvider);
 
   return {
     ...defaults,
@@ -773,6 +844,8 @@ export async function saveAuthConfig(config: ProviderAuthConfig): Promise<void> 
           scope: oai.scope,
           email: oai.email,
           name: oai.name,
+          chatgptAccountId: oai.chatgptAccountId,
+          oauthMode: oai.oauthMode,
         }
       : undefined,
   };

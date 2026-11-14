@@ -55,17 +55,18 @@ GOOGLE_SCOPES = (
 
 
 NUTRITION_SYSTEM_PROMPT = """You are an expert registered dietitian and food nutrition analyst for Plate, an iOS calorie tracker app.
-Analyze the user's meal from the provided food photo and/or user notes (such as gram weights, home-cooked ingredients, sauces, oils, or portion details).
+Analyze the user's meal from the provided food photo and/or user notes (such as gram/milliliter amounts, home-cooked ingredients, sauces, oils, or portion details).
 
 Rules:
-1. If the user specifies exact gram weights, volumes, brands, or ingredients they put into the dish, prioritize those measurements accurately while using the photo to estimate any remaining visible items.
-2. Break the meal down into individual food/ingredient items with realistic gram estimates, calories, protein (g), carbs (g), and fat (g).
-3. Ensure the top-level calories, protein, carbs, and fat equal the sum of the individual items (rounded to nearest whole integer for calories, 1 decimal or integer for macros).
-4. Include a "healthScore" integer from 1 to 10 based on nutrient density, whole foods, protein balance, and fiber.
-5. Return ONLY valid JSON matching this exact structure:
+1. If the user specifies exact metric weights (g, kg) or liquid volumes (mL, L), brands, or ingredients they put into the dish, prioritize those measurements accurately while using the photo to estimate any remaining visible items.
+2. Use ONLY metric SI units everywhere (g, kg, mL, L, cm, m). NEVER output imperial or household kitchen units such as oz, lb, lbs, fl oz, cup, cups, tbsp, tsp, or inches in "title", "summary", "name", or "portion" — always convert any such quantities to g or mL (e.g. "15 mL", "250 mL", "180 g").
+3. Break the meal down into individual food/ingredient items with realistic gram/milliliter estimates, calories (kcal), protein (g), carbs (g), and fat (g).
+4. Ensure the top-level calories, protein, carbs, and fat equal the sum of the individual items (rounded to nearest whole integer for calories, 1 decimal or integer for macros).
+5. Include a "healthScore" integer from 1 to 10 based on nutrient density, whole foods, protein balance, and fiber.
+6. Return ONLY valid JSON matching this exact structure:
 {
   "title": "Concise appetizing meal name",
-  "summary": "1-2 sentence explanation of portion assumptions and key calorie drivers",
+  "summary": "1-2 sentence explanation of metric portion assumptions (g / mL) and key calorie drivers",
   "confidence": "high" | "medium" | "low",
   "healthScore": 8,
   "calories": 550,
@@ -76,7 +77,7 @@ Rules:
     {
       "name": "Chicken breast (grilled)",
       "grams": 180,
-      "portion": "180g (~1 medium fillet)",
+      "portion": "180 g",
       "calories": 297,
       "protein": 55.8,
       "carbs": 0,
@@ -94,7 +95,7 @@ class AnalyzedFoodItem(BaseModel):
     )
     portion: Optional[str] = Field(
         default=None,
-        description="Human-friendly portion description, e.g. '150g' or '1 tbsp'",
+        description="Metric portion description using g, kg, mL, or L only (e.g. '180 g' or '15 mL')",
     )
     calories: float = Field(description="Calories (kcal) for this item")
     protein: float = Field(description="Protein in grams")
@@ -128,7 +129,7 @@ class AnalyzeRequest(BaseModel):
     model: Optional[str] = None
 
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 app = FastAPI(title="CalorieLens Companion Backend", version=APP_VERSION)
 

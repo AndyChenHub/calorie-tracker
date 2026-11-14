@@ -5,6 +5,15 @@ All notable changes to **CalorieLens** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-11-14 (Build 6)
+
+### Changed
+- **100% Metric SI Units Throughout Plate (`cm`, `m`, `km`, `L`, `mL`, `g`, `kg`)**: Standardized hydration goals and logs to liters (`L`) and milliliters (`mL`) instead of glasses, added live meter/kilometer (`m` / `km`) step and workout distances, displayed height in both `cm` and `m`, labeled weight/energy chart axes in `kg` and `kcal`, added metric gram/milliliter portions across the Food Database, and enforced strict metric-only portions (`g`, `kg`, `mL`, `L`) in AI meal analysis.
+
+### Fixed
+- **Automatic On-Device Loopback OAuth Listener (`modules/expo-loopback-oauth`)**: Added a native IPv4 (`127.0.0.1`) + IPv6 (`::1`) loopback HTTP callback server on iOS & Android so **Sign in with ChatGPT** intercepts `http://localhost:1455/auth/callback` directly inside the app, renders a clean confirmation screen, auto-dismisses Safari, and exchanges PKCE tokens without ever getting stuck on `localhost`.
+- **Direct ChatGPT Subscription & Responses Streaming Inference**: Updated OpenAI OAuth inference to support both ChatGPT Codex (`chatgpt.com/backend-api/codex/responses` with `chatgpt-account-id`, `store: false`, `stream: true`, SSE parsing) and OpenAI Responses (`api.openai.com/v1/responses` with `/v1/models` plan discovery, `store: false`, `stream: true`), plus automatic clipboard key capture on Safari close (`Google AI Studio`, `Anthropic Console`, `OpenAI Platform`), sideloaded Keychain persistence fallback, smart ready-provider routing, and a 1-tap **Verify AI connection** check.
+
 ## [1.1.3] - 2026-11-13 (Build 5)
 
 ### Changed

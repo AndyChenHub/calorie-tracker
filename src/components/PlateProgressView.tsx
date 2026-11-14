@@ -281,7 +281,9 @@ export function PlateProgressView({
       >
         <View style={styles.chartHeader}>
           <Text style={styles.chartTitle}>Your BMI</Text>
-          <Text style={styles.chartRightMuted}>{`${profile.heightCm} cm`}</Text>
+          <Text style={styles.chartRightMuted}>
+            {`${profile.heightCm} cm · ${heightMeters.toFixed(2)} m`}
+          </Text>
         </View>
 
         <View style={styles.bmiValueRow}>

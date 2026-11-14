@@ -122,7 +122,7 @@ export function computeWeightChartGeometry({
 }: WeightAreaChartProps) {
   const W = 318;
   const H = 170;
-  const L = 30;
+  const L = 38;
   const T = 12;
   const B = 22;
 
@@ -163,7 +163,7 @@ export function computeWeightChartGeometry({
     const val = mn + ((mx - mn) * i) / 3;
     return {
       y: yOf(val),
-      label: val.toFixed(0),
+      label: `${val.toFixed(0)} kg`,
     };
   });
 

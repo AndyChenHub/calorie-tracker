@@ -19,6 +19,7 @@ import {
   CATALOG_FOODS,
   createExerciseMealEntry,
   createFoodMealEntry,
+  estimateStepMeters,
   formatNum,
   resolveMealImageSource,
   upsertWeightLogPoint,
@@ -165,9 +166,9 @@ function LibrarySheetBody({
                     <Text style={styles.libFoodMeta}>
                       {`${Math.round(meal.calories)} kcal · P ${Math.round(
                         meal.protein
-                      )}g · C ${Math.round(meal.carbs)}g · F ${Math.round(
+                      )} g · C ${Math.round(meal.carbs)} g · F ${Math.round(
                         meal.fat
-                      )}g`}
+                      )} g`}
                     </Text>
                   </View>
                   <Pressable
@@ -219,7 +220,7 @@ function LibrarySheetBody({
                   {food.name}
                 </Text>
                 <Text style={styles.libFoodMeta}>
-                  {`${food.kcal} kcal · P ${food.p}g · C ${food.c}g · F ${food.f}g`}
+                  {`${food.kcal} kcal · ${food.portionLabel} · P ${food.p} g · C ${food.c} g · F ${food.f} g`}
                 </Text>
               </View>
               <Pressable
@@ -356,16 +357,21 @@ function WeightSheetBody({ onClose }: { onClose: () => void }) {
 }
 
 function StepsSheetBody({ onClose }: { onClose: () => void }) {
-  const { selectedDateKey, stepsByDate, setStepsForDate, showToast } =
+  const { selectedDateKey, stepsByDate, setStepsForDate, profile, showToast } =
     useCalorieTracker();
   const [stepsVal, setStepsVal] = useState<number>(
     stepsByDate[selectedDateKey] ?? 0
   );
+  const distanceMeters = estimateStepMeters(stepsVal, profile.heightCm);
+  const distanceKm = (distanceMeters / 1000).toFixed(2);
+  const stepBurnKcal = Math.round(stepsVal * 0.04);
 
   return (
     <View>
       <Text style={styles.sheetTitle}>Daily steps</Text>
-      <Text style={styles.sheetSub}>Update step count for this day</Text>
+      <Text style={styles.sheetSub}>
+        {`${formatNum(distanceMeters)} m (${distanceKm} km) · +${stepBurnKcal} kcal`}
+      </Text>
 
       <View style={styles.bigStepperCenter}>
         <Pressable
@@ -413,7 +419,9 @@ function StepsSheetBody({ onClose }: { onClose: () => void }) {
         onPress={async () => {
           await setStepsForDate(selectedDateKey, stepsVal);
           onClose();
-          showToast(`Steps updated · ${formatNum(stepsVal)}`);
+          showToast(
+            `Steps updated · ${formatNum(stepsVal)} (${distanceKm} km)`
+          );
         }}
         style={styles.sheetPrimaryBtn}
       >
@@ -447,7 +455,11 @@ function ProfileSheetBody({ onClose }: { onClose: () => void }) {
           />
         </View>
         <View style={{ flex: 1 }}>
-          <Text style={styles.fieldLabel}>Height (cm)</Text>
+          <Text style={styles.fieldLabel}>
+            {`Height (cm · ${(
+              Math.max(120, Math.min(240, Number(heightStr) || 175)) / 100
+            ).toFixed(2)} m)`}
+          </Text>
           <TextInput
             value={heightStr}
             onChangeText={setHeightStr}
@@ -838,13 +850,13 @@ function ScannerOverlayContent({ onClose }: { onClose: () => void }) {
           ) : null}
         </View>
 
-        {/* Optional Grams / Ingredients Context Input */}
+        {/* Optional Grams / mL / Ingredients Context Input */}
         <View style={styles.notesGlassWrap}>
           <PlateIcon name="sparkle" size={15} color="rgba(255,255,255,0.8)" />
           <TextInput
             value={userNotes}
             onChangeText={setUserNotes}
-            placeholder="Optional: grams or ingredients (e.g. 180g chicken)…"
+            placeholder="Optional: g or mL (e.g. 180 g chicken, 250 mL milk)…"
             placeholderTextColor="rgba(255,255,255,0.62)"
             style={styles.notesGlassInput}
             returnKeyType="done"
@@ -956,6 +968,7 @@ function NutritionDetailContent({
 
   const [showAddIng, setShowAddIng] = useState(false);
   const [newIngName, setNewIngName] = useState('');
+  const [newIngGrams, setNewIngGrams] = useState('');
   const [newIngKcal, setNewIngKcal] = useState('');
 
   const [showFixBox, setShowFixBox] = useState(false);
@@ -983,13 +996,16 @@ function NutritionDetailContent({
   const handleAddIngredient = async () => {
     const cleanName = newIngName.trim();
     const kcalNum = Math.max(0, Math.round(Number(newIngKcal) || 0));
+    const parsedGrams = Math.max(0, Math.round(Number(newIngGrams) || 0));
     if (!cleanName || kcalNum <= 0) {
-      showToast('Enter ingredient name and calories');
+      showToast('Enter ingredient name and kcal');
       return;
     }
     const addedItem: MealItem = {
       id: `ing_${Date.now()}`,
       name: cleanName,
+      grams: parsedGrams > 0 ? parsedGrams : null,
+      portion: parsedGrams > 0 ? `${parsedGrams} g` : undefined,
       calories: kcalNum,
       protein: 0,
       carbs: 0,
@@ -1002,6 +1018,7 @@ function NutritionDetailContent({
       items: nextItems,
     });
     setNewIngName('');
+    setNewIngGrams('');
     setNewIngKcal('');
     setShowAddIng(false);
     showToast(`${cleanName} added`);
@@ -1009,7 +1026,7 @@ function NutritionDetailContent({
 
   const handleRunFix = async () => {
     if (!fixPrompt.trim()) {
-      showToast('Describe what to adjust (e.g. "no fries" or "200g rice")');
+      showToast('Describe what to adjust (e.g. "no fries" or "200 g rice")');
       return;
     }
     setRefining(true);
@@ -1136,7 +1153,7 @@ function NutritionDetailContent({
               <View>
                 <Text style={styles.detailMacroLabel}>Protein</Text>
                 <Text style={styles.detailMacroVal}>
-                  {`${Math.round(entry.protein * servings)}g`}
+                  {`${Math.round(entry.protein * servings)} g`}
                 </Text>
               </View>
             </View>
@@ -1146,7 +1163,7 @@ function NutritionDetailContent({
               <View>
                 <Text style={styles.detailMacroLabel}>Carbs</Text>
                 <Text style={styles.detailMacroVal}>
-                  {`${Math.round(entry.carbs * servings)}g`}
+                  {`${Math.round(entry.carbs * servings)} g`}
                 </Text>
               </View>
             </View>
@@ -1156,7 +1173,7 @@ function NutritionDetailContent({
               <View>
                 <Text style={styles.detailMacroLabel}>Fats</Text>
                 <Text style={styles.detailMacroVal}>
-                  {`${Math.round(entry.fat * servings)}g`}
+                  {`${Math.round(entry.fat * servings)} g`}
                 </Text>
               </View>
             </View>
@@ -1204,17 +1221,22 @@ function NutritionDetailContent({
           </View>
 
           <View style={styles.ingWrap}>
-            {entry.items.map((item) => (
-              <View key={item.id} style={styles.ingChip}>
-                <Text style={styles.ingChipName}>
-                  {item.name}
-                  {item.grams ? ` (${item.grams}g)` : ''}
-                </Text>
-                <Text style={styles.ingChipKcal}>
-                  {`${Math.round(item.calories * servings)} kcal`}
-                </Text>
-              </View>
-            ))}
+            {entry.items.map((item) => {
+              const metricTag = item.grams
+                ? `${Math.round(item.grams * servings)} g`
+                : item.portion || '';
+              return (
+                <View key={item.id} style={styles.ingChip}>
+                  <Text style={styles.ingChipName}>
+                    {item.name}
+                    {metricTag ? ` (${metricTag})` : ''}
+                  </Text>
+                  <Text style={styles.ingChipKcal}>
+                    {`${Math.round(item.calories * servings)} kcal`}
+                  </Text>
+                </View>
+              );
+            })}
 
             <Pressable
               onPress={() => setShowAddIng((v) => !v)}
@@ -1229,9 +1251,17 @@ function NutritionDetailContent({
               <TextInput
                 value={newIngName}
                 onChangeText={setNewIngName}
-                placeholder="Ingredient (e.g. Olive oil 1 tbsp)"
+                placeholder="Ingredient (e.g. Olive oil 15 mL)"
                 placeholderTextColor={plateColors.faint}
                 style={[styles.sheetInput, { flex: 1 }]}
+              />
+              <TextInput
+                value={newIngGrams}
+                onChangeText={setNewIngGrams}
+                placeholder="g"
+                placeholderTextColor={plateColors.faint}
+                keyboardType="numeric"
+                style={[styles.sheetInput, { width: 58 }]}
               />
               <TextInput
                 value={newIngKcal}
@@ -1239,7 +1269,7 @@ function NutritionDetailContent({
                 placeholder="kcal"
                 placeholderTextColor={plateColors.faint}
                 keyboardType="numeric"
-                style={[styles.sheetInput, { width: 72 }]}
+                style={[styles.sheetInput, { width: 66 }]}
               />
               <Pressable onPress={handleAddIngredient} style={styles.smallDarkBtn}>
                 <Text style={styles.smallDarkBtnText}>Add</Text>
@@ -1250,13 +1280,13 @@ function NutritionDetailContent({
           {showFixBox ? (
             <View style={[styles.fixBox, cardShadow]}>
               <Text style={styles.fixBoxTitle}>
-                Refine with AI (describe grams or changes)
+                Refine with AI (describe g, mL, or changes)
               </Text>
               <View style={{ flexDirection: 'row', gap: 8 }}>
                 <TextInput
                   value={fixPrompt}
                   onChangeText={setFixPrompt}
-                  placeholder='e.g. "no fries, 200g beef patty"'
+                  placeholder='e.g. "no fries, 200 g beef patty, 15 mL sauce"'
                   placeholderTextColor={plateColors.faint}
                   style={[styles.sheetInput, { flex: 1 }]}
                 />

@@ -18,20 +18,26 @@ import {
   useIsDesktopStage,
 } from '../components/PhoneStageFrame';
 import { PlateIcon } from '../components/PlatePrimitives';
+import {
+  estimateStepMeters,
+  formatMetersMetric,
+  WATER_STEP_LITERS,
+} from '../constants/plateCatalog';
 import { getAppVersionMetadata } from '../constants/version';
 import { useCalorieTracker } from '../context/CalorieContext';
 import {
   cancelPendingChatGPTSignIn,
   completeOnDeviceChatGPTCallback,
+  detectApiKeyProvider,
   disconnectChatGPTOAuth,
   disconnectGoogleOAuth,
   isProviderConfigured,
   looksLikeOAuthCallbackInput,
-  openProviderWebsite,
-  PROVIDER_AUTH_PORTALS,
+  openProviderPortalForKey,
   signInWithGoogleOAuth,
   startChatGPTDeviceCodeSignIn,
   startChatGPTSignIn,
+  testAIProviderConnection,
 } from '../services/ai';
 import { cardShadow, colors, plateColors } from '../theme/colors';
 import { AIProviderId } from '../types/models';
@@ -120,8 +126,11 @@ export default function OnboardingScreen() {
   const [stepsInput, setStepsInput] = useState(
     String(goals.dailySteps || 10000)
   );
+  const initialWaterGlasses = goals.waterGlasses || 8;
   const [waterInput, setWaterInput] = useState(
-    String(goals.waterGlasses || 8)
+    (initialWaterGlasses * WATER_STEP_LITERS).toFixed(
+      initialWaterGlasses % 2 === 0 ? 1 : 2
+    )
   );
 
   const [addBurnedPref, setAddBurnedPref] = useState(preferences.addBurned);
@@ -150,6 +159,7 @@ export default function OnboardingScreen() {
     verificationUrl: string;
   } | null>(null);
   const deviceCodeAbortRef = useRef<AbortController | null>(null);
+  const [testingAi, setTestingAi] = useState(false);
   const [saving, setSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{
     ok: boolean;
@@ -184,9 +194,16 @@ export default function OnboardingScreen() {
     1000,
     Math.min(50000, parseInt(stepsInput, 10) || 10000)
   );
+  const parsedWaterLiters = Math.max(
+    0.25,
+    Math.min(
+      5,
+      Math.round((parseFloat(waterInput.replace(',', '.')) || 2) * 4) / 4
+    )
+  );
   const parsedWaterGlasses = Math.max(
     1,
-    Math.min(20, parseInt(waterInput, 10) || 8)
+    Math.min(20, Math.round(parsedWaterLiters / WATER_STEP_LITERS))
   );
 
   const syncMacrosFromCaloriesAndSplit = (
@@ -223,8 +240,9 @@ export default function OnboardingScreen() {
   };
 
   const stepWaterGoal = (delta: number) => {
-    const next = Math.max(1, Math.min(20, parsedWaterGlasses + delta));
-    setWaterInput(String(next));
+    const nextSteps = Math.max(1, Math.min(20, parsedWaterGlasses + delta));
+    const liters = nextSteps * WATER_STEP_LITERS;
+    setWaterInput(liters.toFixed(nextSteps % 2 === 0 ? 1 : 2));
   };
 
   const parsedStartWeight = Math.max(
@@ -277,11 +295,18 @@ export default function OnboardingScreen() {
     setStatusMsg(null);
     setOauthBusy(true);
     try {
-      const res = await startChatGPTSignIn(auth);
+      const res = await startChatGPTSignIn(auth, 'codex');
       if (res.mode === 'on_device_connected') {
+        if (!res.session.accessToken && res.apiKeyIssued) {
+          setOpenaiKeyDraft(res.apiKeyIssued);
+        }
+        setSelectedProvider('gpt');
         await updateAuth({
           activeProvider: 'gpt',
           chatgptOAuth: res.session,
+          ...(!res.session.accessToken && res.apiKeyIssued
+            ? { openaiApiKey: res.apiKeyIssued }
+            : {}),
         });
         setAwaitingGptCallback(false);
         setCallbackUrlDraft('');
@@ -296,6 +321,7 @@ export default function OnboardingScreen() {
           auth.companionUrl,
           auth.companionToken
         );
+        setSelectedProvider('gpt');
         await updateAuth({ activeProvider: 'gpt' });
         setAwaitingGptCallback(false);
         const email = st?.chatgptOAuth?.email;
@@ -309,7 +335,7 @@ export default function OnboardingScreen() {
         setAwaitingGptCallback(true);
         setStatusMsg({
           ok: true,
-          text: 'Approve in your browser, copy the 127.0.0.1 redirect URL & tap Complete below.',
+          text: 'Approve in your browser, copy the localhost redirect URL & tap Complete below.',
         });
       }
     } catch (err) {
@@ -329,6 +355,7 @@ export default function OnboardingScreen() {
       const candidate =
         callbackUrlDraft.trim() || (await Clipboard.getStringAsync()).trim();
       const session = await completeOnDeviceChatGPTCallback(candidate, auth);
+      setSelectedProvider('gpt');
       await updateAuth({
         activeProvider: 'gpt',
         chatgptOAuth: session,
@@ -376,13 +403,16 @@ export default function OnboardingScreen() {
         },
         controller.signal
       );
-      if (res.apiKeyIssued) {
+      if (!res.session.accessToken && res.apiKeyIssued) {
         setOpenaiKeyDraft(res.apiKeyIssued);
       }
+      setSelectedProvider('gpt');
       await updateAuth({
         activeProvider: 'gpt',
         chatgptOAuth: res.session,
-        ...(res.apiKeyIssued ? { openaiApiKey: res.apiKeyIssued } : {}),
+        ...(!res.session.accessToken && res.apiKeyIssued
+          ? { openaiApiKey: res.apiKeyIssued }
+          : {}),
       });
       setDeviceCodeInfo(null);
       setAwaitingGptCallback(false);
@@ -420,6 +450,7 @@ export default function OnboardingScreen() {
         auth.companionUrl,
         auth.companionToken
       );
+      setSelectedProvider('antigravity');
       await updateAuth({ activeProvider: 'antigravity' });
       setStatusMsg({
         ok: true,
@@ -439,13 +470,47 @@ export default function OnboardingScreen() {
 
   const handleOpenOfficialSite = async (provider: AIProviderId) => {
     setStatusMsg(null);
-    await openProviderWebsite(PROVIDER_AUTH_PORTALS[provider]);
+    const capturedKey = await openProviderPortalForKey(provider);
+    if (capturedKey) {
+      setSelectedProvider(provider);
+      if (provider === 'antigravity') {
+        setGeminiKeyDraft(capturedKey);
+        await updateAuth({
+          geminiApiKey: capturedKey,
+          activeProvider: 'antigravity',
+        });
+        setStatusMsg({
+          ok: true,
+          text: 'Google AI key connected automatically!',
+        });
+      } else if (provider === 'claude') {
+        setClaudeKeyDraft(capturedKey);
+        await updateAuth({
+          claudeApiKey: capturedKey,
+          activeProvider: 'claude',
+        });
+        setStatusMsg({
+          ok: true,
+          text: 'Anthropic Claude key connected automatically!',
+        });
+      } else {
+        setOpenaiKeyDraft(capturedKey);
+        await updateAuth({
+          openaiApiKey: capturedKey,
+          activeProvider: 'gpt',
+        });
+        setStatusMsg({
+          ok: true,
+          text: 'OpenAI key connected automatically!',
+        });
+      }
+      return;
+    }
     const labelMap: Record<AIProviderId, string> = {
       antigravity:
-        'Opened Google AI Studio — sign in with Google, copy key & tap Paste.',
-      claude:
-        'Opened Anthropic Console — sign in to Claude, copy key & tap Paste.',
-      gpt: 'Opened OpenAI Platform — sign in, copy key & tap Paste.',
+        'Copy your Google AI Studio key & tap Paste below.',
+      claude: 'Copy your Anthropic Console key & tap Paste below.',
+      gpt: 'Copy your OpenAI API key & tap Paste below.',
     };
     setStatusMsg({ ok: true, text: labelMap[provider] });
   };
@@ -460,16 +525,9 @@ export default function OnboardingScreen() {
         });
         return;
       }
-      if (target === 'antigravity') {
-        setGeminiKeyDraft(clip);
-        await updateAuth({ geminiApiKey: clip, activeProvider: 'antigravity' });
-        setStatusMsg({ ok: true, text: 'Google AI key pasted & saved!' });
-      } else if (target === 'claude') {
-        setClaudeKeyDraft(clip);
-        await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
-        setStatusMsg({ ok: true, text: 'Anthropic Claude key pasted & saved!' });
-      } else if (looksLikeOAuthCallbackInput(clip)) {
+      if (looksLikeOAuthCallbackInput(clip)) {
         const session = await completeOnDeviceChatGPTCallback(clip, auth);
+        setSelectedProvider('gpt');
         await updateAuth({
           activeProvider: 'gpt',
           chatgptOAuth: session,
@@ -482,7 +540,21 @@ export default function OnboardingScreen() {
             ? `Connected to ChatGPT (${session.email})`
             : 'Connected via OpenAI ChatGPT SSO!',
         });
+        return;
+      }
+      const detected = detectApiKeyProvider(clip) || target;
+      if (detected === 'antigravity') {
+        setSelectedProvider('antigravity');
+        setGeminiKeyDraft(clip);
+        await updateAuth({ geminiApiKey: clip, activeProvider: 'antigravity' });
+        setStatusMsg({ ok: true, text: 'Google AI key pasted & saved!' });
+      } else if (detected === 'claude') {
+        setSelectedProvider('claude');
+        setClaudeKeyDraft(clip);
+        await updateAuth({ claudeApiKey: clip, activeProvider: 'claude' });
+        setStatusMsg({ ok: true, text: 'Anthropic Claude key pasted & saved!' });
       } else {
+        setSelectedProvider('gpt');
         setOpenaiKeyDraft(clip);
         await updateAuth({ openaiApiKey: clip, activeProvider: 'gpt' });
         setStatusMsg({ ok: true, text: 'OpenAI key pasted & saved!' });
@@ -495,6 +567,34 @@ export default function OnboardingScreen() {
             ? err.message
             : 'Paste directly into the key input below.',
       });
+    }
+  };
+
+  const handleTestAi = async () => {
+    setStatusMsg(null);
+    setTestingAi(true);
+    try {
+      const res = await testAIProviderConnection(
+        {
+          ...auth,
+          activeProvider: selectedProvider,
+          claudeApiKey: claudeKey.trim(),
+          openaiApiKey: openaiKey.trim(),
+          geminiApiKey: geminiKey.trim(),
+        },
+        selectedProvider
+      );
+      setStatusMsg({
+        ok: true,
+        text: `✓ AI verified (${res.modelUsed || colors.providers[res.providerUsed].label})`,
+      });
+    } catch (err) {
+      setStatusMsg({
+        ok: false,
+        text: err instanceof Error ? err.message : 'AI connection check failed',
+      });
+    } finally {
+      setTestingAi(false);
     }
   };
 
@@ -637,7 +737,7 @@ export default function OnboardingScreen() {
             <View style={styles.cardTopRow}>
               <Text style={styles.cardTitle}>Your profile</Text>
               <Text style={styles.weightSummaryPill}>
-                {`BMI ${previewBmi} · ${
+                {`BMI ${previewBmi} · ${(parsedHeightCm / 100).toFixed(2)} m · ${
                   Math.abs(weightGoalDelta) < 0.05
                     ? 'Maintain'
                     : weightGoalDelta < 0
@@ -671,7 +771,9 @@ export default function OnboardingScreen() {
               </View>
 
               <View style={[styles.weightSetupCol, { flex: 1 }]}>
-                <Text style={styles.weightFieldLabel}>Height</Text>
+                <Text style={styles.weightFieldLabel}>
+                  {`Height (${(parsedHeightCm / 100).toFixed(2)} m)`}
+                </Text>
                 <View style={styles.weightInputBox}>
                   <Pressable
                     onPress={() => stepHeight(-1)}
@@ -774,15 +876,15 @@ export default function OnboardingScreen() {
               <Text style={styles.cardTitle}>Daily calories & macros</Text>
               <Text style={styles.macroSummary}>
                 <Text style={{ color: plateColors.protein }}>
-                  {`${parsedProtein}P`}
+                  {`${parsedProtein} g P`}
                 </Text>
                 {' · '}
                 <Text style={{ color: plateColors.carbs }}>
-                  {`${parsedCarbs}C`}
+                  {`${parsedCarbs} g C`}
                 </Text>
                 {' · '}
                 <Text style={{ color: plateColors.fat }}>
-                  {`${parsedFat}F`}
+                  {`${parsedFat} g F`}
                 </Text>
               </Text>
             </View>
@@ -932,7 +1034,11 @@ export default function OnboardingScreen() {
 
             <View style={styles.weightSetupRow}>
               <View style={styles.weightSetupCol}>
-                <Text style={styles.weightFieldLabel}>Daily steps goal</Text>
+                <Text style={styles.weightFieldLabel}>
+                  {`Daily steps (${formatMetersMetric(
+                    estimateStepMeters(parsedStepsGoal, parsedHeightCm)
+                  )})`}
+                </Text>
                 <View style={styles.weightInputBox}>
                   <Pressable
                     onPress={() => stepStepsGoal(-500)}
@@ -961,7 +1067,7 @@ export default function OnboardingScreen() {
               </View>
 
               <View style={styles.weightSetupCol}>
-                <Text style={styles.weightFieldLabel}>Daily water goal</Text>
+                <Text style={styles.weightFieldLabel}>Daily water (L)</Text>
                 <View style={styles.weightInputBox}>
                   <Pressable
                     onPress={() => stepWaterGoal(-1)}
@@ -974,11 +1080,11 @@ export default function OnboardingScreen() {
                     <TextInput
                       value={waterInput}
                       onChangeText={setWaterInput}
-                      keyboardType="numeric"
-                      maxLength={2}
+                      keyboardType="decimal-pad"
+                      maxLength={4}
                       style={styles.weightInputText}
                     />
-                    <Text style={styles.weightInputUnit}>gl</Text>
+                    <Text style={styles.weightInputUnit}>L</Text>
                   </View>
                   <Pressable
                     onPress={() => stepWaterGoal(1)}
@@ -1381,6 +1487,21 @@ export default function OnboardingScreen() {
                   </Pressable>
                 </View>
               </View>
+            ) : null}
+
+            {providerConfigState.ready ? (
+              <Pressable
+                onPress={handleTestAi}
+                disabled={testingAi}
+                style={[styles.secondaryAuthBtn, { marginTop: 10 }]}
+              >
+                {testingAi ? (
+                  <ActivityIndicator size="small" color={plateColors.ink} />
+                ) : null}
+                <Text style={styles.secondaryAuthBtnText}>
+                  {testingAi ? 'Testing AI connection…' : 'Verify AI connection'}
+                </Text>
+              </Pressable>
             ) : null}
           </View>
         </ScrollView>

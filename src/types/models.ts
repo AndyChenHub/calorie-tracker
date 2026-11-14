@@ -86,6 +86,8 @@ export interface ChatGPTOnDeviceSession {
   scope?: string;
   email?: string;
   name?: string;
+  chatgptAccountId?: string;
+  oauthMode?: 'siwc' | 'codex';
 }
 
 export interface ProviderAuthConfig {

@@ -3,7 +3,7 @@
     "name": "Plate",
     "slug": "calorie-tracker",
     "scheme": "calorietracker",
-    "version": "1.1.3",
+    "version": "1.1.4",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -14,18 +14,21 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.calorielens.tracker",
-      "buildNumber": "5",
+      "buildNumber": "6",
       "config": {
         "usesNonExemptEncryption": false
       },
       "infoPlist": {
         "NSCameraUsageDescription": "Plate uses your camera to take photos of your meals and analyze calories and macros.",
-        "NSPhotoLibraryUsageDescription": "Plate accesses your photo library so you can upload meal photos for calorie and macro analysis."
+        "NSPhotoLibraryUsageDescription": "Plate accesses your photo library so you can upload meal photos for calorie and macro analysis.",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
       }
     },
     "android": {
       "package": "com.calorielens.tracker",
-      "versionCode": 5,
+      "versionCode": 6,
       "adaptiveIcon": {
         "backgroundColor": "#121216",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -53,7 +56,7 @@
     ],
     "extra": {
       "releaseChannel": "stable",
-      "releaseDate": "2026-11-13"
+      "releaseDate": "2026-11-14"
     }
   }
 }

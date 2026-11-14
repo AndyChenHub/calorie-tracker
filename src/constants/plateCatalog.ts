@@ -10,6 +10,41 @@ import {
 } from '../types/models';
 import { inferMealTypeByHour, toLocalDateKey } from '../utils/date';
 
+export type MetricPortionUnit = 'g' | 'mL';
+
+export const WATER_STEP_ML = 250;
+export const WATER_STEP_LITERS = 0.25;
+
+export function formatWaterLiters(steps250ml: number): string {
+  const safeSteps = Math.max(0, Math.round(steps250ml || 0));
+  if (safeSteps === 0) return '0 L';
+  const liters = safeSteps * WATER_STEP_LITERS;
+  const decimals = safeSteps % 2 === 0 ? 1 : 2;
+  return `${liters.toFixed(decimals)} L`;
+}
+
+export function estimateStepMeters(
+  steps: number,
+  heightCm: number = 175
+): number {
+  const safeHeight = Math.max(120, Math.min(240, heightCm || 175));
+  const strideMeters = safeHeight * 0.00414;
+  return Math.max(0, Math.round((steps || 0) * strideMeters));
+}
+
+export function formatMetersMetric(meters: number): string {
+  const safeMeters = Math.max(0, Math.round(meters || 0));
+  if (safeMeters < 1000) {
+    return `${formatNum(safeMeters)} m`;
+  }
+  return `${(safeMeters / 1000).toFixed(1)} km`;
+}
+
+export function formatHeightMetric(heightCm: number): string {
+  const safeCm = Math.max(120, Math.min(240, Math.round(heightCm || 175)));
+  return `${safeCm} cm (${(safeCm / 100).toFixed(2)} m)`;
+}
+
 export interface CatalogFood {
   id: string;
   name: string;
@@ -18,7 +53,8 @@ export interface CatalogFood {
   c: number;
   f: number;
   health: number;
-  ing: [string, number][];
+  portionLabel: string;
+  ing: [string, number, number, MetricPortionUnit?][];
 }
 
 export interface CatalogExercise {
@@ -39,11 +75,12 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 38,
     f: 22,
     health: 8,
+    portionLabel: '242 g',
     ing: [
-      ['Sourdough', 180],
-      ['Avocado', 160],
-      ['Poached egg', 72],
-      ['Chili flakes', 8],
+      ['Sourdough', 180, 75, 'g'],
+      ['Avocado', 160, 100, 'g'],
+      ['Poached egg', 72, 65, 'g'],
+      ['Chili flakes', 8, 2, 'g'],
     ],
   },
   {
@@ -54,13 +91,14 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 68,
     f: 21,
     health: 9,
+    portionLabel: '435 g',
     ing: [
-      ['Sushi rice', 260],
-      ['Salmon', 190],
-      ['Avocado', 80],
-      ['Edamame', 50],
-      ['Cucumber', 10],
-      ['Sesame', 20],
+      ['Sushi rice', 260, 200, 'g'],
+      ['Salmon', 190, 110, 'g'],
+      ['Avocado', 80, 50, 'g'],
+      ['Edamame', 50, 40, 'g'],
+      ['Cucumber', 10, 30, 'g'],
+      ['Sesame', 20, 5, 'g'],
     ],
   },
   {
@@ -71,11 +109,12 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 42,
     f: 7,
     health: 9,
+    portionLabel: '285 g',
     ing: [
-      ['Greek yogurt', 150],
-      ['Granola', 100],
-      ['Berries', 35],
-      ['Honey', 25],
+      ['Greek yogurt', 150, 170, 'g'],
+      ['Granola', 100, 25, 'g'],
+      ['Berries', 35, 80, 'g'],
+      ['Honey', 25, 10, 'g'],
     ],
   },
   {
@@ -86,12 +125,13 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 16,
     f: 27,
     health: 7,
+    portionLabel: '305 g',
     ing: [
-      ['Grilled chicken', 220],
-      ['Caesar dressing', 140],
-      ['Croutons', 70],
-      ['Parmesan', 40],
-      ['Romaine', 10],
+      ['Grilled chicken', 220, 150, 'g'],
+      ['Caesar dressing', 140, 30, 'mL'],
+      ['Croutons', 70, 20, 'g'],
+      ['Parmesan', 40, 15, 'g'],
+      ['Romaine', 10, 90, 'g'],
     ],
   },
   {
@@ -102,11 +142,12 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 92,
     f: 24,
     health: 6,
+    portionLabel: '455 g',
     ing: [
-      ['Spaghetti', 380],
-      ['Beef ragù', 270],
-      ['Parmesan', 60],
-      ['Basil', 10],
+      ['Spaghetti', 380, 240, 'g'],
+      ['Beef ragù', 270, 195, 'g'],
+      ['Parmesan', 60, 15, 'g'],
+      ['Basil', 10, 5, 'g'],
     ],
   },
   {
@@ -117,11 +158,12 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 46,
     f: 4,
     health: 9,
+    portionLabel: '350 mL',
     ing: [
-      ['Banana', 105],
-      ['Spinach', 10],
-      ['Mango', 70],
-      ['Chia seeds', 55],
+      ['Banana', 105, 120, 'g'],
+      ['Spinach', 10, 40, 'g'],
+      ['Mango', 70, 110, 'g'],
+      ['Chia seeds', 55, 12, 'g'],
     ],
   },
   {
@@ -132,12 +174,13 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 96,
     f: 58,
     health: 3,
+    portionLabel: '395 g',
     ing: [
-      ['Brioche bun', 220],
-      ['Beef patty', 300],
-      ['Cheddar', 110],
-      ['Fries', 420],
-      ['Sauce', 30],
+      ['Brioche bun', 220, 75, 'g'],
+      ['Beef patty', 300, 140, 'g'],
+      ['Cheddar', 110, 30, 'g'],
+      ['Fries', 420, 130, 'g'],
+      ['Sauce', 30, 20, 'mL'],
     ],
   },
   {
@@ -148,11 +191,12 @@ export const CATALOG_FOODS: CatalogFood[] = [
     c: 58,
     f: 18,
     health: 8,
+    portionLabel: '250 g',
     ing: [
-      ['Rolled oats', 190],
-      ['Peanut butter', 190],
-      ['Banana', 55],
-      ['Chia', 25],
+      ['Rolled oats', 190, 50, 'g'],
+      ['Peanut butter', 190, 32, 'g'],
+      ['Banana', 55, 60, 'g'],
+      ['Chia', 25, 5, 'g'],
     ],
   },
 ];
@@ -164,7 +208,7 @@ export const CATALOG_EXERCISES: CatalogExercise[] = [
     kcal: 310,
     intensity: 'High',
     icon: 'activity',
-    desc: '30 min · 5:40 /km',
+    desc: '30 min · 5.3 km · 5:40 /km',
   },
   {
     name: 'Weight lifting',
@@ -172,7 +216,7 @@ export const CATALOG_EXERCISES: CatalogExercise[] = [
     kcal: 220,
     intensity: 'Medium',
     icon: 'dumbbell',
-    desc: '45 min · full body',
+    desc: '45 min · full body (kg)',
   },
   {
     name: 'Walk',
@@ -180,7 +224,7 @@ export const CATALOG_EXERCISES: CatalogExercise[] = [
     kcal: 150,
     intensity: 'Low',
     icon: 'walk',
-    desc: '40 min · easy pace',
+    desc: '40 min · 3,200 m (3.2 km)',
   },
 ];
 
@@ -229,11 +273,13 @@ function makeUid(): string {
 
 export function catalogFoodToItems(food: CatalogFood): MealItem[] {
   const totalKcal = Math.max(1, food.kcal);
-  return food.ing.map(([name, kcal], idx) => {
+  return food.ing.map(([name, kcal, amount, unit = 'g'], idx) => {
     const share = kcal / totalKcal;
     return {
       id: `${food.id}_ing_${idx}`,
       name,
+      grams: unit === 'g' ? amount : null,
+      portion: `${amount} ${unit}`,
       calories: kcal,
       protein: Number((food.p * share).toFixed(1)),
       carbs: Number((food.c * share).toFixed(1)),

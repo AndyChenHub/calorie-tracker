@@ -12,8 +12,12 @@ import {
   View,
 } from 'react-native';
 import {
+  estimateStepMeters,
+  formatMetersMetric,
   formatNum,
+  formatWaterLiters,
   resolveMealImageSource,
+  WATER_STEP_ML,
 } from '../constants/plateCatalog';
 import { useCalorieTracker } from '../context/CalorieContext';
 import { isProviderConfigured } from '../services/ai';
@@ -134,6 +138,7 @@ export function PlateHomeView({
     selectedDaySummary,
     streakCount,
     goals,
+    profile,
     preferences,
     updatePreferences,
     waterByDate,
@@ -215,6 +220,7 @@ export function PlateHomeView({
   const steps = stepsByDate[selectedDateKey] ?? 0;
   const water = waterByDate[selectedDateKey] ?? 0;
   const stepKcal = Math.round(steps * 0.04);
+  const stepMeters = estimateStepMeters(steps, profile.heightCm);
 
   const handleCarouselLayout = (e: LayoutChangeEvent) => {
     const w = Math.round(e.nativeEvent.layout.width);
@@ -259,7 +265,7 @@ export function PlateHomeView({
     return (
       <View key={key} style={[styles.macroCard, cardShadow]}>
         <View>
-          <Text style={styles.macroVal}>{`${displayVal}g`}</Text>
+          <Text style={styles.macroVal}>{`${displayVal} g`}</Text>
           <Text style={styles.macroLabel} numberOfLines={1}>
             {`${name} `}
             {eaten ? (
@@ -525,7 +531,9 @@ export function PlateHomeView({
                 <View>
                   <Text style={styles.miniVal}>{formatNum(steps)}</Text>
                   <Text style={styles.miniSub}>
-                    {`of ${formatNum(goals.dailySteps)} steps`}
+                    {`of ${formatNum(goals.dailySteps)} · ${formatMetersMetric(
+                      stepMeters
+                    )}`}
                   </Text>
                 </View>
                 <View style={{ alignSelf: 'flex-start' }}>
@@ -573,9 +581,11 @@ export function PlateHomeView({
               </View>
 
               <View style={{ flex: 1 }}>
-                <Text style={styles.waterVal}>{`${water * 250} ml`}</Text>
+                <Text style={styles.waterVal}>{formatWaterLiters(water)}</Text>
                 <Text style={styles.waterSub}>
-                  {`Water · ${water}/${goals.waterGlasses} glasses`}
+                  {`Water · ${water * WATER_STEP_ML} mL / ${formatWaterLiters(
+                    goals.waterGlasses
+                  )}`}
                 </Text>
                 <View style={styles.glassesRow}>
                   {Array.from(
@@ -783,7 +793,7 @@ export function PlateHomeView({
                         color={plateColors.protein}
                       />
                       <Text style={styles.macroMiniText}>
-                        {`${Math.round(entry.protein * mult)}g`}
+                        {`${Math.round(entry.protein * mult)} g`}
                       </Text>
                     </View>
                     <View style={styles.macroMiniItem}>
@@ -793,7 +803,7 @@ export function PlateHomeView({
                         color={plateColors.carbs}
                       />
                       <Text style={styles.macroMiniText}>
-                        {`${Math.round(entry.carbs * mult)}g`}
+                        {`${Math.round(entry.carbs * mult)} g`}
                       </Text>
                     </View>
                     <View style={styles.macroMiniItem}>
@@ -803,7 +813,7 @@ export function PlateHomeView({
                         color={plateColors.fat}
                       />
                       <Text style={styles.macroMiniText}>
-                        {`${Math.round(entry.fat * mult)}g`}
+                        {`${Math.round(entry.fat * mult)} g`}
                       </Text>
                     </View>
                   </View>

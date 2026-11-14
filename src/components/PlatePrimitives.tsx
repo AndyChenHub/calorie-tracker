@@ -329,13 +329,14 @@ export function WeightAreaChart(props: WeightAreaChartProps) {
           strokeWidth={1.5}
         />
         <SvgText
-          x={g.W - 46}
+          x={g.W - 2}
           y={g.goalY - 6}
+          textAnchor="end"
           fill="#34C77B"
           fontSize={10.5}
           fontWeight="600"
         >
-          {`Goal ${goalWeight}`}
+          {`Goal ${goalWeight} kg`}
         </SvgText>
 
         {g.hasTrendLine ? (
@@ -419,7 +420,7 @@ export function WeeklyMacroBarsChart({
           fontSize={10.5}
           fontWeight="500"
         >
-          {`Goal ${formatNum(calorieGoal)}`}
+          {`Goal ${formatNum(calorieGoal)} kcal`}
         </SvgText>
       </Svg>
     </View>

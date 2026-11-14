@@ -1,0 +1,10 @@
+{
+  "name": "expo-loopback-oauth",
+  "version": "1.0.0",
+  "description": "Local loopback HTTP OAuth callback listener for Plate on iOS and Android",
+  "main": "index.ts",
+  "types": "index.ts",
+  "license": "MIT",
+  "author": "Plate",
+  "homepage": "https://github.com/AndyChenHub/calorie-tracker"
+}

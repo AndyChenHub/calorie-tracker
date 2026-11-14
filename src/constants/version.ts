@@ -5,10 +5,10 @@ import { Platform } from 'react-native';
 /**
  * Synchronized by `scripts/bump-version.mjs` alongside `package.json`, `app.json`, and `backend/server.py`.
  */
-export const FALLBACK_APP_VERSION = '1.1.3';
-export const FALLBACK_BUILD_NUMBER = '5';
+export const FALLBACK_APP_VERSION = '1.1.4';
+export const FALLBACK_BUILD_NUMBER = '6';
 export const EXPO_SDK_MAJOR = '58';
-export const RELEASE_DATE = '2026-11-13';
+export const RELEASE_DATE = '2026-11-14';
 
 export interface AppVersionMetadata {
   version: string;
